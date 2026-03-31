@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -259,30 +258,27 @@ def decode_grib_nearest_value(
     longitude: float,
 ) -> float:
     try:
-        from eccodes import codes_grib_find_nearest, codes_grib_new_from_file, codes_release
+        from eccodes import codes_grib_find_nearest, codes_release
+        from gribapi.gribapi import grib_new_from_message
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
             "NOAA GFS extraction requires the 'eccodes' Python package plus the ecCodes C library."
         ) from exc
 
-    with tempfile.NamedTemporaryFile(suffix=".grib2") as tmp:
-        tmp.write(content)
-        tmp.flush()
-        tmp.seek(0)
-        handle = codes_grib_new_from_file(tmp)
-        if handle is None:
-            raise RuntimeError("Failed to decode GRIB message for NOAA GFS record.")
-        try:
-            nearest = codes_grib_find_nearest(handle, latitude, longitude)
-            if isinstance(nearest, (list, tuple)) and nearest:
-                sample = nearest[0]
-                if isinstance(sample, dict) and "value" in sample:
-                    return float(sample["value"])
-            if isinstance(nearest, dict) and "value" in nearest:
-                return float(nearest["value"])
-            raise RuntimeError("ecCodes did not return a nearest-point value.")
-        finally:
-            codes_release(handle)
+    handle = grib_new_from_message(content)
+    if handle is None:
+        raise RuntimeError("Failed to decode GRIB message for NOAA GFS record.")
+    try:
+        nearest = codes_grib_find_nearest(handle, latitude, longitude)
+        if isinstance(nearest, (list, tuple)) and nearest:
+            sample = nearest[0]
+            if isinstance(sample, dict) and "value" in sample:
+                return float(sample["value"])
+        if isinstance(nearest, dict) and "value" in nearest:
+            return float(nearest["value"])
+        raise RuntimeError("ecCodes did not return a nearest-point value.")
+    finally:
+        codes_release(handle)
 
 
 def _to_local_naive(ts_utc: datetime, timezone: str) -> datetime:
