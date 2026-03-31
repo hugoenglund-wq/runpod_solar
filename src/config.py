@@ -46,6 +46,26 @@ class ProjectPaths:
         )
 
     @property
+    def weather_previous_runs_wide_csv(self) -> Path:
+        return (
+            self.data_dir
+            / "raw"
+            / "weather"
+            / "previous_runs_hourly"
+            / "weather_previous_runs_wide.csv"
+        )
+
+    @property
+    def weather_noaa_gfs_issue_valid_csv(self) -> Path:
+        return (
+            self.data_dir
+            / "raw"
+            / "weather"
+            / "noaa_gfs_hourly"
+            / "weather_noaa_gfs_issue_valid.csv"
+        )
+
+    @property
     def metadata_json(self) -> Path:
         return self.data_dir / "metadata" / "system_metadata.json"
 

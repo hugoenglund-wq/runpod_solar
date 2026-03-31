@@ -147,6 +147,35 @@ def load_previous_runs_forecast_frame(paths: ProjectPaths | None = None) -> pd.D
     return df
 
 
+def load_previous_runs_wide_frame(paths: ProjectPaths | None = None) -> pd.DataFrame:
+    paths = paths or default_project_paths()
+    if paths.weather_previous_runs_wide_csv.exists():
+        df = _read_csv(paths.weather_previous_runs_wide_csv, parse_dates=["time"])
+        return df.sort_values("time").reset_index(drop=True)
+
+    chunks_dir = paths.weather_previous_runs_wide_csv.parent / "chunks"
+    chunk_paths = sorted(chunks_dir.glob("*_wide.csv"))
+    if not chunk_paths:
+        raise FileNotFoundError(
+            "No previous-runs wide master file or chunk files were found in the organized data directory."
+        )
+
+    frames = [pd.read_csv(chunk_path, parse_dates=["time"]) for chunk_path in chunk_paths]
+    df = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["time"])
+    return df.sort_values("time").reset_index(drop=True)
+
+
+def load_noaa_gfs_forecast_frame(paths: ProjectPaths | None = None) -> pd.DataFrame:
+    paths = paths or default_project_paths()
+    if not paths.weather_noaa_gfs_issue_valid_csv.exists():
+        raise FileNotFoundError(f"NOAA GFS forecast file was not found: {paths.weather_noaa_gfs_issue_valid_csv}")
+    df = _read_csv(
+        paths.weather_noaa_gfs_issue_valid_csv,
+        parse_dates=["forecast_issue_time", "forecast_valid_time"],
+    )
+    return df.sort_values(["forecast_issue_time", "forecast_valid_time"]).reset_index(drop=True)
+
+
 def build_horizon_training_frame(
     horizon_steps: int = FORECAST_HORIZON_STEPS,
     *,

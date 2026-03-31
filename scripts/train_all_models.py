@@ -30,10 +30,28 @@ def parse_args() -> argparse.Namespace:
         help="Optional train data filter end (origin_time), format YYYY-MM-DD.",
     )
     parser.add_argument(
-        "--validation-days",
+        "--evaluation-fraction",
+        type=float,
+        default=0.20,
+        help="Fraction of issue days to reserve for backtest evaluation across folds.",
+    )
+    parser.add_argument(
+        "--max-folds",
+        type=int,
+        default=8,
+        help="Maximum number of seasonal backtest folds.",
+    )
+    parser.add_argument(
+        "--preferred-window-days",
         type=int,
         default=30,
-        help="Validation window length in days.",
+        help="Preferred validation window length per fold in issue days.",
+    )
+    parser.add_argument(
+        "--min-train-issue-days",
+        type=int,
+        default=60,
+        help="Minimum number of issue days required before the first validation fold.",
     )
     parser.add_argument(
         "--quick-test",
@@ -58,7 +76,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config = TrainConfig(
-        validation_days=args.validation_days,
+        evaluation_fraction=args.evaluation_fraction,
+        max_folds=args.max_folds,
+        preferred_window_days=args.preferred_window_days,
+        min_train_issue_days=args.min_train_issue_days,
         min_train_rows=args.min_train_rows,
         min_val_rows=args.min_val_rows,
         start_date=args.start_date,

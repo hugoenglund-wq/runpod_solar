@@ -1,0 +1,290 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+
+
+@dataclass(frozen=True)
+class FeatureConfig:
+    lags: tuple[int, ...]
+    rolling_windows: tuple[int, ...]
+
+
+DEFAULT_FEATURE_CONFIG = FeatureConfig(
+    lags=(1, 2, 4, 8, 16, 96, 192, 672),
+    rolling_windows=(4, 16, 96),
+)
+
+QUICK_TEST_FEATURE_CONFIG = FeatureConfig(
+    lags=(1, 2, 4, 8, 16, 96),
+    rolling_windows=(4, 16),
+)
+
+
+def build_issue_feature_frame(
+    issue_frame: pd.DataFrame,
+    *,
+    config: FeatureConfig,
+    latitude: float,
+    longitude: float,
+    tilt_deg: float | None,
+    azimuth_deg: float | None,
+    system_capacity_w: float,
+) -> pd.DataFrame:
+    out = issue_frame.sort_values("origin_time").reset_index(drop=True).copy()
+    out = add_timestamp_features(
+        out,
+        time_col="origin_time",
+        prefix="origin",
+        latitude=latitude,
+        longitude=longitude,
+        tilt_deg=tilt_deg,
+        azimuth_deg=azimuth_deg,
+        system_capacity_w=system_capacity_w,
+    )
+    out = _add_issue_history_features(out, config=config, system_capacity_w=system_capacity_w)
+    return out
+
+
+def add_target_features(
+    frame: pd.DataFrame,
+    *,
+    latitude: float,
+    longitude: float,
+    tilt_deg: float | None,
+    azimuth_deg: float | None,
+    system_capacity_w: float,
+) -> pd.DataFrame:
+    out = frame.copy()
+    out = add_timestamp_features(
+        out,
+        time_col="target_time",
+        prefix="target",
+        latitude=latitude,
+        longitude=longitude,
+        tilt_deg=tilt_deg,
+        azimuth_deg=azimuth_deg,
+        system_capacity_w=system_capacity_w,
+    )
+    delta = out["target_time"] - out["origin_time"]
+    out["lead_minutes"] = delta.dt.total_seconds() / 60.0
+    out["lead_hours"] = out["lead_minutes"] / 60.0
+    out["lead_steps"] = out["lead_minutes"] / 15.0
+    out["target_day_offset"] = (
+        out["target_time"].dt.normalize() - out["origin_time"].dt.normalize()
+    ).dt.days.astype(int)
+    out["remaining_day_minutes_at_issue"] = (
+        (out["origin_time"].dt.normalize() + pd.Timedelta(days=1)) - out["origin_time"]
+    ).dt.total_seconds() / 60.0
+    return out
+
+
+def add_timestamp_features(
+    frame: pd.DataFrame,
+    *,
+    time_col: str,
+    prefix: str,
+    latitude: float,
+    longitude: float,
+    tilt_deg: float | None,
+    azimuth_deg: float | None,
+    system_capacity_w: float,
+) -> pd.DataFrame:
+    out = frame.copy()
+    ts = out[time_col]
+    out[f"{prefix}_hour"] = ts.dt.hour
+    out[f"{prefix}_minute"] = ts.dt.minute
+    out[f"{prefix}_day_of_week"] = ts.dt.dayofweek
+    out[f"{prefix}_day_of_year"] = ts.dt.dayofyear
+    out[f"{prefix}_month"] = ts.dt.month
+    out[f"{prefix}_week_of_year"] = ts.dt.isocalendar().week.astype(int)
+    out[f"{prefix}_is_weekend"] = (out[f"{prefix}_day_of_week"] >= 5).astype(int)
+
+    out[f"{prefix}_sin_hour"] = np.sin(2.0 * math.pi * out[f"{prefix}_hour"] / 24.0)
+    out[f"{prefix}_cos_hour"] = np.cos(2.0 * math.pi * out[f"{prefix}_hour"] / 24.0)
+    out[f"{prefix}_sin_day_of_year"] = np.sin(
+        2.0 * math.pi * out[f"{prefix}_day_of_year"] / 366.0
+    )
+    out[f"{prefix}_cos_day_of_year"] = np.cos(
+        2.0 * math.pi * out[f"{prefix}_day_of_year"] / 366.0
+    )
+
+    season_idx = ((out[f"{prefix}_month"] % 12) // 3).astype(int)
+    out[f"{prefix}_season_idx"] = season_idx
+    out[f"{prefix}_season"] = season_idx.map(
+        {
+            0: "winter",
+            1: "spring",
+            2: "summer",
+            3: "autumn",
+        }
+    )
+
+    out = _add_solar_geometry_features(
+        out,
+        time_col=time_col,
+        prefix=prefix,
+        latitude=latitude,
+        longitude=longitude,
+        tilt_deg=tilt_deg,
+        azimuth_deg=azimuth_deg,
+        system_capacity_w=system_capacity_w,
+    )
+    return out
+
+
+def _add_issue_history_features(
+    df: pd.DataFrame,
+    *,
+    config: FeatureConfig,
+    system_capacity_w: float,
+) -> pd.DataFrame:
+    out = df.copy()
+    for lag in config.lags:
+        out[f"lag_power_{lag}"] = out["power_w"].shift(lag)
+
+    shifted = out["power_w"].shift(1)
+    for window in config.rolling_windows:
+        rolled = shifted.rolling(window=window, min_periods=1)
+        out[f"roll_mean_power_{window}"] = rolled.mean()
+        out[f"roll_max_power_{window}"] = rolled.max()
+        out[f"roll_std_power_{window}"] = rolled.std()
+        out[f"roll_sum_power_{window}"] = rolled.sum()
+
+    out["power_kw"] = out["power_w"] / 1000.0
+    if system_capacity_w > 0:
+        out["power_capacity_ratio"] = out["power_w"] / system_capacity_w
+    out["is_daylight_proxy"] = (out["power_w"] > 5.0).astype(int)
+    return out
+
+
+def _add_solar_geometry_features(
+    df: pd.DataFrame,
+    *,
+    time_col: str,
+    prefix: str,
+    latitude: float,
+    longitude: float,
+    tilt_deg: float | None,
+    azimuth_deg: float | None,
+    system_capacity_w: float,
+) -> pd.DataFrame:
+    out = df.copy()
+    ts = out[time_col]
+    day_of_year = ts.dt.dayofyear.to_numpy(dtype=float)
+    hour = ts.dt.hour.to_numpy(dtype=float)
+    minute = ts.dt.minute.to_numpy(dtype=float)
+
+    tz_offset = round(longitude / 15.0)
+    gamma = (2.0 * np.pi / 365.0) * (day_of_year - 1.0 + ((hour - 12.0) / 24.0))
+    eqtime = 229.18 * (
+        0.000075
+        + 0.001868 * np.cos(gamma)
+        - 0.032077 * np.sin(gamma)
+        - 0.014615 * np.cos(2.0 * gamma)
+        - 0.040849 * np.sin(2.0 * gamma)
+    )
+    decl = (
+        0.006918
+        - 0.399912 * np.cos(gamma)
+        + 0.070257 * np.sin(gamma)
+        - 0.006758 * np.cos(2.0 * gamma)
+        + 0.000907 * np.sin(2.0 * gamma)
+        - 0.002697 * np.cos(3.0 * gamma)
+        + 0.00148 * np.sin(3.0 * gamma)
+    )
+
+    time_offset = eqtime + (4.0 * longitude) - (60.0 * tz_offset)
+    true_solar_minutes = np.mod((hour * 60.0) + minute + time_offset, 1440.0)
+    hour_angle_deg = (true_solar_minutes / 4.0) - 180.0
+
+    lat_rad = np.deg2rad(latitude)
+    hour_angle_rad = np.deg2rad(hour_angle_deg)
+    cos_zenith = (
+        np.sin(lat_rad) * np.sin(decl)
+        + np.cos(lat_rad) * np.cos(decl) * np.cos(hour_angle_rad)
+    )
+    cos_zenith = np.clip(cos_zenith, -1.0, 1.0)
+    zenith_rad = np.arccos(cos_zenith)
+    elevation_deg = 90.0 - np.rad2deg(zenith_rad)
+    cos_zenith_clipped = np.clip(cos_zenith, 0.0, 1.0)
+
+    azimuth_rad = np.arctan2(
+        np.sin(hour_angle_rad),
+        (np.cos(hour_angle_rad) * np.sin(lat_rad)) - (np.tan(decl) * np.cos(lat_rad)),
+    )
+    solar_azimuth_deg = (np.rad2deg(azimuth_rad) + 180.0) % 360.0
+
+    out[f"{prefix}_solar_elevation_deg"] = elevation_deg
+    out[f"{prefix}_solar_azimuth_deg"] = solar_azimuth_deg
+    out[f"{prefix}_solar_cos_zenith"] = cos_zenith_clipped
+    out[f"{prefix}_is_daylight_solar"] = (elevation_deg > 0.0).astype(int)
+
+    panel_tilt = float(tilt_deg or 0.0)
+    panel_azimuth = float(azimuth_deg or 180.0)
+    elev_rad = np.deg2rad(np.clip(elevation_deg, -90.0, 90.0))
+    solar_azimuth_rad = np.deg2rad(solar_azimuth_deg)
+    panel_tilt_rad = np.deg2rad(panel_tilt)
+    panel_azimuth_rad = np.deg2rad(panel_azimuth)
+
+    cos_incidence = (
+        np.sin(elev_rad) * np.cos(panel_tilt_rad)
+        + np.cos(elev_rad)
+        * np.sin(panel_tilt_rad)
+        * np.cos(solar_azimuth_rad - panel_azimuth_rad)
+    )
+    cos_incidence = np.clip(cos_incidence, 0.0, 1.0)
+    out[f"{prefix}_panel_cos_incidence"] = cos_incidence
+    out[f"{prefix}_clear_sky_power_proxy_w"] = cos_incidence * max(system_capacity_w, 0.0)
+    return out
+
+
+def prepare_model_matrix(
+    frame: pd.DataFrame,
+    *,
+    target_col: str = "target_power_w",
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, list[str]]:
+    work = frame.copy()
+    drop_cols = {
+        target_col,
+        "origin_time",
+        "target_time",
+        "issue_date",
+        "target_date",
+        "target_season",
+        "origin_season",
+        "baseline_previous_day_power_w",
+        "baseline_previous_week_power_w",
+        "baseline_issue_persistence_w",
+        "forecast_valid_hour",
+        "forecast_source_time",
+        "is_missing_target_power",
+        "fold_id",
+        "fold_name",
+    }
+    meta_cols = [
+        "origin_time",
+        "target_time",
+        "issue_date",
+        "target_date",
+        "target_season",
+        "baseline_previous_day_power_w",
+        "baseline_previous_week_power_w",
+        "baseline_issue_persistence_w",
+    ]
+    if "forecast_available_at_origin" in work.columns:
+        meta_cols.append("forecast_available_at_origin")
+
+    feature_candidates = [
+        col for col in work.columns if col not in drop_cols and col not in meta_cols
+    ]
+    numeric_feature_cols = [
+        col for col in feature_candidates if pd.api.types.is_numeric_dtype(work[col])
+    ]
+    X = work.loc[:, numeric_feature_cols].copy()
+    y = work[target_col].astype(float).copy()
+    meta = work.loc[:, [col for col in meta_cols if col in work.columns]].copy()
+    return X, y, meta, numeric_feature_cols

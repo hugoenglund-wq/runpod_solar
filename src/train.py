@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,49 +8,34 @@ import joblib
 import pandas as pd
 
 from src.config import SYSTEM_CAPACITY_W
-from src.data_loader import (
-    build_horizon_training_frame,
-    default_project_paths,
-    load_system_metadata,
-)
-from src.evaluate import (
-    aggregate_metrics_table,
-    baseline_daily,
-    baseline_persistence,
-    evaluate_predictions,
-)
-from src.feature_engineering import (
+from src.data_loader import default_project_paths, load_system_metadata
+from src.day_features import (
     DEFAULT_FEATURE_CONFIG,
     QUICK_TEST_FEATURE_CONFIG,
-    build_feature_frame,
     prepare_model_matrix,
 )
+from src.day_frames import DEFAULT_DAY_MODEL_SPECS, DayModelSpec, build_day_model_frame
+from src.evaluate import (
+    aggregate_metrics_table,
+    clip_physical_predictions,
+    evaluate_by_group,
+    evaluate_prediction_frame,
+)
 from src.models import ModelConfig, fit_regressor, predict_regressor
-from src.splits import SplitConfig, time_train_validation_split
-
-
-@dataclass(frozen=True)
-class ModelSpec:
-    name: str
-    horizon_steps: int
-    require_forecast_archive: bool
-
-    @property
-    def horizon_hours(self) -> float:
-        return self.horizon_steps / 4.0
-
-
-DEFAULT_MODEL_SPECS = (
-    ModelSpec(name="same_day_intraday", horizon_steps=4, require_forecast_archive=False),
-    ModelSpec(name="day_plus_1", horizon_steps=96, require_forecast_archive=True),
-    ModelSpec(name="day_plus_2", horizon_steps=192, require_forecast_archive=True),
-    ModelSpec(name="day_plus_3", horizon_steps=288, require_forecast_archive=True),
+from src.splits import (
+    BacktestConfig,
+    build_issue_date_backtest_folds,
+    split_frame_for_fold,
+    summarize_season_coverage,
 )
 
 
 @dataclass(frozen=True)
 class TrainConfig:
-    validation_days: int = 30
+    evaluation_fraction: float = 0.20
+    max_folds: int = 8
+    preferred_window_days: int = 30
+    min_train_issue_days: int = 60
     min_train_rows: int = 500
     min_val_rows: int = 100
     start_date: str | None = None
@@ -63,7 +47,7 @@ class TrainConfig:
 def train_all_models(
     *,
     artifacts_dir: Path,
-    model_specs: tuple[ModelSpec, ...] = DEFAULT_MODEL_SPECS,
+    model_specs: tuple[DayModelSpec, ...] = DEFAULT_DAY_MODEL_SPECS,
     train_config: TrainConfig = TrainConfig(),
     project_root: Path | None = None,
 ) -> pd.DataFrame:
@@ -82,9 +66,7 @@ def train_all_models(
             train_config=train_config,
             artifacts_dir=artifacts_dir,
             paths=paths,
-            latitude=metadata.latitude,
-            longitude=metadata.longitude,
-            system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
+            metadata=metadata,
         )
         rows.append(row)
 
@@ -96,66 +78,41 @@ def train_all_models(
 
 def train_single_model(
     *,
-    spec: ModelSpec,
+    spec: DayModelSpec,
     train_config: TrainConfig,
     artifacts_dir: Path,
     paths,
-    latitude: float,
-    longitude: float,
-    system_capacity_w: float,
+    metadata,
 ) -> dict[str, object]:
-    frame = build_horizon_training_frame(
-        horizon_steps=spec.horizon_steps,
+    feature_cfg = QUICK_TEST_FEATURE_CONFIG if train_config.quick_test else DEFAULT_FEATURE_CONFIG
+    frame = build_day_model_frame(
+        spec,
         paths=paths,
-        include_history_weather=True,
-        include_leakage_safe_forecast=spec.require_forecast_archive,
-        drop_missing_forecast=spec.require_forecast_archive,
+        metadata=metadata,
+        feature_config=feature_cfg,
+        daylight_only_targets=True,
     )
     frame = filter_date_range(frame, train_config.start_date, train_config.end_date)
+    frame = frame.loc[frame["target_power_w"].notna()].copy()
     if frame.empty:
-        raise ValueError(f"{spec.name}: no rows after date filtering.")
+        raise ValueError(f"{spec.name}: no rows after filtering.")
 
-    feature_cfg = QUICK_TEST_FEATURE_CONFIG if train_config.quick_test else DEFAULT_FEATURE_CONFIG
-    feat = build_feature_frame(
-        frame,
-        config=feature_cfg,
-        latitude=latitude,
-        longitude=longitude,
+    backtest_cfg = BacktestConfig(
+        evaluation_fraction=train_config.evaluation_fraction,
+        preferred_window_days=train_config.preferred_window_days,
+        max_folds=train_config.max_folds,
+        min_train_issue_days=train_config.min_train_issue_days,
+        purge_issue_days=max(1, spec.day_offset),
     )
-    split_cfg = SplitConfig(
-        validation_days=train_config.validation_days,
-        purge_hours=max(1, int(math.ceil(spec.horizon_hours))),
-    )
-    train_df, val_df = time_train_validation_split(feat, config=split_cfg)
+    folds = build_issue_date_backtest_folds(frame, config=backtest_cfg)
 
-    if len(train_df) < train_config.min_train_rows:
-        raise ValueError(f"{spec.name}: train set too small ({len(train_df)} rows).")
-    if len(val_df) < train_config.min_val_rows:
-        raise ValueError(f"{spec.name}: validation set too small ({len(val_df)} rows).")
-
-    X_train, y_train, meta_train, feature_cols = prepare_model_matrix(train_df)
-    X_val, y_val, meta_val, _ = prepare_model_matrix(val_df)
-
-    model = fit_regressor(
-        X_train,
-        y_train,
-        config=ModelConfig(random_state=train_config.random_state),
-    )
-    y_pred = predict_regressor(model, X_val)
-
-    baseline_persist = baseline_persistence(val_df)
-    baseline_day = baseline_daily(val_df)
-    metrics_persist = evaluate_predictions(
-        y_val.to_numpy(),
-        y_pred,
-        baseline_pred=baseline_persist,
-        system_capacity_w=system_capacity_w,
-    )
-    metrics_day = evaluate_predictions(
-        y_val.to_numpy(),
-        y_pred,
-        baseline_pred=baseline_day,
-        system_capacity_w=system_capacity_w,
+    first_train, first_val = split_frame_for_fold(frame, folds[0])
+    selected_backend = choose_backend(
+        spec=spec,
+        train_df=first_train,
+        val_df=first_val,
+        random_state=train_config.random_state,
+        system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
     )
 
     model_dir = ensure_dir(artifacts_dir / "models" / spec.name)
@@ -163,36 +120,167 @@ def train_single_model(
     pred_dir = ensure_dir(artifacts_dir / "predictions")
     data_dir = ensure_dir(artifacts_dir / "datasets")
 
+    fold_metric_rows: list[dict[str, object]] = []
+    validation_frames: list[pd.DataFrame] = []
+    seasonal_metric_frames: list[pd.DataFrame] = []
+
+    for fold in folds:
+        train_df, val_df = split_frame_for_fold(frame, fold)
+        if len(train_df) < train_config.min_train_rows:
+            raise ValueError(f"{spec.name}/{fold.fold_name}: train set too small ({len(train_df)} rows).")
+        if len(val_df) < train_config.min_val_rows:
+            raise ValueError(f"{spec.name}/{fold.fold_name}: validation set too small ({len(val_df)} rows).")
+
+        X_train, y_train, _, feature_cols = prepare_model_matrix(train_df)
+        X_val, _, meta_val, _ = prepare_model_matrix(val_df)
+        model = fit_regressor(
+            X_train,
+            y_train,
+            config=ModelConfig(
+                random_state=train_config.random_state,
+                backend=selected_backend,
+            ),
+        )
+        y_pred = clip_physical_predictions(
+            predict_regressor(model, X_val),
+            system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
+        )
+
+        overall_metrics = evaluate_prediction_frame(
+            val_df,
+            y_pred,
+            baseline_col="baseline_previous_day_power_w",
+            system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
+        )
+        persistence_metrics = evaluate_prediction_frame(
+            val_df,
+            y_pred,
+            baseline_col="baseline_issue_persistence_w",
+            system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
+        )
+        weekly_metrics = evaluate_prediction_frame(
+            val_df,
+            y_pred,
+            baseline_col="baseline_previous_week_power_w",
+            system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
+        )
+
+        fold_metric_rows.append(
+            {
+                "fold_name": fold.fold_name,
+                "fold_id": fold.fold_id,
+                "train_rows": int(len(train_df)),
+                "validation_rows": int(len(val_df)),
+                "backend": model.backend,
+                "mae_w": float(overall_metrics["mae_w"]),
+                "rmse_w": float(overall_metrics["rmse_w"]),
+                "bias_w": float(overall_metrics["bias_w"]),
+                "skill_vs_daily": float(overall_metrics.get("skill_vs_baseline", 0.0)),
+                "skill_vs_persistence": float(persistence_metrics.get("skill_vs_baseline", 0.0)),
+                "skill_vs_weekly": float(weekly_metrics.get("skill_vs_baseline", 0.0)),
+            }
+        )
+
+        pred_frame = meta_val.copy()
+        pred_frame["fold_name"] = fold.fold_name
+        pred_frame["model_name"] = spec.name
+        pred_frame["y_pred"] = y_pred
+        pred_frame["target_power_w"] = val_df["target_power_w"].astype(float).to_numpy()
+        pred_frame["target_season"] = val_df["target_season"].astype(str).to_numpy()
+        validation_frames.append(pred_frame)
+
+        seasonal_metrics = evaluate_by_group(
+            val_df,
+            y_pred,
+            group_col="target_season",
+            baseline_col="baseline_previous_day_power_w",
+            system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
+        )
+        seasonal_metrics["fold_name"] = fold.fold_name
+        seasonal_metric_frames.append(seasonal_metrics)
+
+    validation_backtest = pd.concat(validation_frames, ignore_index=True)
+    seasonal_metrics_all = pd.concat(seasonal_metric_frames, ignore_index=True)
+    overall_backtest_metrics = evaluate_prediction_frame(
+        validation_backtest,
+        validation_backtest["y_pred"].to_numpy(),
+        baseline_col="baseline_previous_day_power_w",
+        system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
+    )
+    persistence_backtest_metrics = evaluate_prediction_frame(
+        validation_backtest,
+        validation_backtest["y_pred"].to_numpy(),
+        baseline_col="baseline_issue_persistence_w",
+        system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
+    )
+    weekly_backtest_metrics = evaluate_prediction_frame(
+        validation_backtest,
+        validation_backtest["y_pred"].to_numpy(),
+        baseline_col="baseline_previous_week_power_w",
+        system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
+    )
+
+    season_coverage = summarize_season_coverage(validation_backtest, season_col="target_season")
+    warnings: list[str] = []
+    if season_coverage["season_count"] < 4:
+        warnings.append(
+            "Validation data does not span all four seasons with the currently available leakage-safe inputs."
+        )
+
+    X_full, y_full, _, feature_cols = prepare_model_matrix(frame)
+    final_model = fit_regressor(
+        X_full,
+        y_full,
+        config=ModelConfig(
+            random_state=train_config.random_state,
+            backend=selected_backend,
+        ),
+    )
+
     model_path = model_dir / "model.joblib"
     model_meta = {
         "name": spec.name,
-        "horizon_steps": spec.horizon_steps,
-        "horizon_hours": spec.horizon_hours,
-        "backend": model.backend,
+        "day_offset": spec.day_offset,
+        "issue_schedule": spec.issue_schedule,
+        "backend": final_model.backend,
+        "selected_backend_request": selected_backend,
         "feature_columns": feature_cols,
+        "daylight_only_targets": True,
+        "season_coverage": season_coverage,
+        "warnings": warnings,
     }
     joblib.dump(
         {
             "model_meta": model_meta,
-            "fitted_model": model,
+            "fitted_model": final_model,
         },
         model_path,
     )
 
-    train_df.to_csv(data_dir / f"{spec.name}_train.csv", index=False)
-    val_df.to_csv(data_dir / f"{spec.name}_validation.csv", index=False)
-
-    pred_frame = meta_val.copy()
-    pred_frame["y_pred"] = y_pred
-    pred_frame["baseline_persistence"] = baseline_persist
-    pred_frame["baseline_daily"] = baseline_day
-    pred_frame.to_csv(pred_dir / f"{spec.name}_validation_predictions.csv", index=False)
+    frame.to_csv(data_dir / f"{spec.name}_train_pool.csv.gz", index=False, compression="gzip")
+    validation_backtest.to_csv(
+        data_dir / f"{spec.name}_validation_backtest.csv.gz",
+        index=False,
+        compression="gzip",
+    )
+    validation_backtest.to_csv(
+        pred_dir / f"{spec.name}_validation_predictions.csv.gz",
+        index=False,
+        compression="gzip",
+    )
+    pd.DataFrame(fold_metric_rows).to_csv(metrics_dir / f"{spec.name}_fold_metrics.csv", index=False)
+    seasonal_metrics_all.to_csv(metrics_dir / f"{spec.name}_seasonal_metrics.csv", index=False)
 
     metrics_payload = {
         "model": model_meta,
-        "validation_rows": int(len(y_val)),
-        "metrics_vs_persistence": metrics_persist,
-        "metrics_vs_daily": metrics_day,
+        "train_rows": int(len(frame)),
+        "validation_rows": int(len(validation_backtest)),
+        "backtest_overall_vs_daily": overall_backtest_metrics,
+        "backtest_overall_vs_persistence": persistence_backtest_metrics,
+        "backtest_overall_vs_weekly": weekly_backtest_metrics,
+        "fold_metrics": fold_metric_rows,
+        "season_coverage": season_coverage,
+        "warnings": warnings,
     }
     (metrics_dir / f"{spec.name}_metrics.json").write_text(
         json.dumps(metrics_payload, indent=2),
@@ -201,18 +289,59 @@ def train_single_model(
 
     return {
         "model_name": spec.name,
-        "horizon_steps": spec.horizon_steps,
-        "horizon_hours": spec.horizon_hours,
-        "backend": model.backend,
-        "train_rows": int(len(train_df)),
-        "validation_rows": int(len(val_df)),
-        "mae_w": float(metrics_day["mae_w"]),
-        "rmse_w": float(metrics_day["rmse_w"]),
-        "bias_w": float(metrics_day["bias_w"]),
-        "skill_vs_daily": float(metrics_day.get("skill_vs_baseline", 0.0)),
-        "skill_vs_persistence": float(metrics_persist.get("skill_vs_baseline", 0.0)),
+        "day_offset": spec.day_offset,
+        "backend": final_model.backend,
+        "train_rows": int(len(frame)),
+        "validation_rows": int(len(validation_backtest)),
+        "mae_w": float(overall_backtest_metrics["mae_w"]),
+        "rmse_w": float(overall_backtest_metrics["rmse_w"]),
+        "bias_w": float(overall_backtest_metrics["bias_w"]),
+        "skill_vs_daily": float(overall_backtest_metrics.get("skill_vs_baseline", 0.0)),
+        "skill_vs_persistence": float(persistence_backtest_metrics.get("skill_vs_baseline", 0.0)),
+        "skill_vs_weekly": float(weekly_backtest_metrics.get("skill_vs_baseline", 0.0)),
+        "season_count": int(season_coverage["season_count"]),
         "model_path": str(model_path),
     }
+
+
+def choose_backend(
+    *,
+    spec: DayModelSpec,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    random_state: int,
+    system_capacity_w: float,
+) -> str:
+    if spec.day_offset == 0:
+        return "lightgbm"
+
+    candidates = ["xgboost", "lightgbm"]
+    results: list[tuple[str, float]] = []
+    X_train, y_train, _, _ = prepare_model_matrix(train_df)
+    X_val, _, _, _ = prepare_model_matrix(val_df)
+    for backend in candidates:
+        model = fit_regressor(
+            X_train,
+            y_train,
+            config=ModelConfig(random_state=random_state, backend=backend),
+        )
+        y_pred = clip_physical_predictions(
+            predict_regressor(model, X_val),
+            system_capacity_w=system_capacity_w,
+        )
+        metrics = evaluate_prediction_frame(
+            val_df,
+            y_pred,
+            baseline_col="baseline_previous_day_power_w",
+            system_capacity_w=system_capacity_w,
+        )
+        results.append((model.backend, float(metrics["mae_w"])))
+
+    if not results:
+        return "auto"
+
+    results = sorted(results, key=lambda item: item[1])
+    return results[0][0]
 
 
 def filter_date_range(

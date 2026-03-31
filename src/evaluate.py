@@ -51,3 +51,60 @@ def baseline_daily(frame: pd.DataFrame) -> np.ndarray:
 
 def aggregate_metrics_table(rows: list[dict[str, object]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
+
+
+def clip_physical_predictions(
+    y_pred: np.ndarray,
+    *,
+    system_capacity_w: float | None = None,
+) -> np.ndarray:
+    upper = float(system_capacity_w) if system_capacity_w and system_capacity_w > 0 else None
+    if upper is None:
+        return np.clip(np.asarray(y_pred, dtype=float), 0.0, None)
+    return np.clip(np.asarray(y_pred, dtype=float), 0.0, upper)
+
+
+def evaluate_prediction_frame(
+    frame: pd.DataFrame,
+    y_pred: np.ndarray,
+    *,
+    baseline_col: str | None,
+    system_capacity_w: float | None = None,
+) -> dict[str, float]:
+    baseline_pred = None
+    if baseline_col and baseline_col in frame.columns:
+        baseline_pred = frame[baseline_col].astype(float).to_numpy()
+    return evaluate_predictions(
+        frame["target_power_w"].astype(float).to_numpy(),
+        y_pred,
+        baseline_pred=baseline_pred,
+        system_capacity_w=system_capacity_w,
+    )
+
+
+def evaluate_by_group(
+    frame: pd.DataFrame,
+    y_pred: np.ndarray,
+    *,
+    group_col: str,
+    baseline_col: str | None,
+    system_capacity_w: float | None = None,
+) -> pd.DataFrame:
+    work = frame.copy()
+    work["y_pred"] = y_pred
+    rows: list[dict[str, object]] = []
+    for group_value, part in work.groupby(group_col, dropna=False):
+        metrics = evaluate_prediction_frame(
+            part,
+            part["y_pred"].to_numpy(),
+            baseline_col=baseline_col,
+            system_capacity_w=system_capacity_w,
+        )
+        rows.append(
+            {
+                group_col: group_value,
+                "rows": int(len(part)),
+                **metrics,
+            }
+        )
+    return pd.DataFrame(rows).sort_values(group_col).reset_index(drop=True)
