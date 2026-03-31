@@ -4,21 +4,14 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 
 
-NOAA_THREDDS_CATALOG = "https://www.ncei.noaa.gov/thredds/catalog"
-NOAA_THREDDS_FILESERVER = "https://www.ncei.noaa.gov/thredds/fileServer"
-THREDDS_NS = {"t": "http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0"}
-DEFAULT_DATASET_ROOTS = (
-    "model-gfs-004-files",
-    "model-gfs-004-files-old",
-    "model-gfs-003-files-old",
-)
+NOAA_GFS_AWS_BUCKET = "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
+S3_NS = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
 DEFAULT_VARIABLE_PATTERNS = {
     "temperature_2m": [r":TMP:2 m above ground:"],
     "cloud_cover": [r":TCDC:entire atmosphere:[^:]*fcst:"],
@@ -30,11 +23,11 @@ DEFAULT_VARIABLE_PATTERNS = {
 class CatalogFile:
     issue_time_utc: datetime
     lead_hours: int
-    url_path: str
+    object_key: str
 
     @property
     def file_url(self) -> str:
-        return f"{NOAA_THREDDS_FILESERVER}/{self.url_path}"
+        return f"{NOAA_GFS_AWS_BUCKET}/{self.object_key}"
 
     @property
     def inv_url(self) -> str:
@@ -59,33 +52,28 @@ def discover_catalog_files_for_issue(
     session: requests.Session,
     *,
     issue_time_utc: datetime,
-    dataset_roots: tuple[str, ...] = DEFAULT_DATASET_ROOTS,
 ) -> list[CatalogFile]:
-    year_month = issue_time_utc.strftime("%Y%m")
     ymd = issue_time_utc.strftime("%Y%m%d")
     issue_hour = issue_time_utc.strftime("%H")
 
     candidate_sets: list[list[CatalogFile]] = []
-    for dataset_root in dataset_roots:
-        catalog_url = f"{NOAA_THREDDS_CATALOG}/{dataset_root}/{year_month}/{ymd}/catalog.xml"
-        response = session.get(catalog_url, timeout=120)
-        if response.status_code != 200:
+    for prefix in _candidate_s3_prefixes(ymd=ymd, issue_hour=issue_hour):
+        keys = _list_s3_keys(session, prefix=prefix)
+        if not keys:
             continue
 
-        root = ET.fromstring(response.text)
         files: list[CatalogFile] = []
-        for ds in root.findall(".//t:dataset[@urlPath]", THREDDS_NS):
-            name = ds.attrib.get("name", "")
-            if f"{issue_hour}:00 UTC" not in name:
+        for object_key in keys:
+            if object_key.endswith(".idx") or ".f" not in object_key:
                 continue
-            match = re.search(r"fct:(\d{3})\.grb2", name)
+            match = re.search(r"\.f(\d{3})$", object_key)
             if not match:
                 continue
             files.append(
                 CatalogFile(
                     issue_time_utc=issue_time_utc,
                     lead_hours=int(match.group(1)),
-                    url_path=ds.attrib["urlPath"],
+                    object_key=object_key,
                 )
             )
         if files:
@@ -102,6 +90,28 @@ def discover_catalog_files_for_issue(
         reverse=True,
     )
     return candidate_sets[0]
+
+
+def _candidate_s3_prefixes(*, ymd: str, issue_hour: str) -> tuple[str, ...]:
+    return (
+        f"gfs.{ymd}/{issue_hour}/atmos/gfs.t{issue_hour}z.pgrb2.0p25.f",
+        f"gfs.{ymd}/{issue_hour}/gfs.t{issue_hour}z.pgrb2.1p00.",
+        f"gfs.{ymd}/{issue_hour}/gfs.t{issue_hour}z.pgrb2.0p25.f",
+    )
+
+
+def _list_s3_keys(
+    session: requests.Session,
+    *,
+    prefix: str,
+    max_keys: int = 1000,
+) -> list[str]:
+    url = f"{NOAA_GFS_AWS_BUCKET}?prefix={prefix}&max-keys={max_keys}"
+    response = session.get(url, timeout=120)
+    if response.status_code != 200:
+        return []
+    root = ET.fromstring(response.text)
+    return [elem.text for elem in root.findall(".//s3:Key", S3_NS) if elem.text]
 
 
 def required_leads_for_local_day_offsets(
