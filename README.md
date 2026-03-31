@@ -17,6 +17,7 @@ Clone the repo and run:
 
 ```bash
 bash scripts/setup_runpod_noaa.sh
+source .venv/bin/activate
 ```
 
 That installs:
