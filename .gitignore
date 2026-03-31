@@ -1,10 +1,6 @@
-# Data and local artifacts
-data/
+# Local artifacts
 artifacts/
 artifacts_smoke_week/
-
-# Local raw CSV input
-solar_dataset_2021_2024.csv
 
 # Python cache
 __pycache__/

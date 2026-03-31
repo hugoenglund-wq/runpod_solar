@@ -1,0 +1,10 @@
+{
+  "azimuth": 180.0,
+  "coverage_end": "2024-04-02",
+  "coverage_start": "2021-01-01",
+  "installed_kwp": 11.0,
+  "latitude": 57.704,
+  "longitude": 11.771,
+  "tilt": 27.0,
+  "timezone": "Europe/Stockholm"
+}
