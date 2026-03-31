@@ -30,8 +30,11 @@ class CatalogFile:
         return f"{NOAA_GFS_AWS_BUCKET}/{self.object_key}"
 
     @property
-    def inv_url(self) -> str:
-        return f"{self.file_url}.inv"
+    def inventory_urls(self) -> tuple[str, ...]:
+        return (
+            f"{self.file_url}.idx",
+            f"{self.file_url}.inv",
+        )
 
 
 def build_daily_issue_times(
@@ -147,7 +150,7 @@ def extract_issue_point_forecast(
         values = extract_point_values_for_file(
             session,
             file_url=catalog_file.file_url,
-            inv_url=catalog_file.inv_url,
+            inventory_urls=catalog_file.inventory_urls,
             latitude=latitude,
             longitude=longitude,
             variable_patterns=variable_patterns,
@@ -213,13 +216,13 @@ def extract_point_values_for_file(
     session: requests.Session,
     *,
     file_url: str,
-    inv_url: str,
+    inventory_urls: tuple[str, ...],
     latitude: float,
     longitude: float,
     variable_patterns: dict[str, list[str]],
 ) -> dict[str, float]:
-    inventory_lines = session.get(inv_url, timeout=120).text.splitlines()
-    if not inventory_lines or inventory_lines[0].startswith("<!doctype html"):
+    inventory_lines = download_inventory_lines(session, inventory_urls=inventory_urls)
+    if not inventory_lines:
         return {}
 
     values: dict[str, float] = {}
@@ -237,6 +240,25 @@ def extract_point_values_for_file(
             longitude=longitude,
         )
     return values
+
+
+def download_inventory_lines(
+    session: requests.Session,
+    *,
+    inventory_urls: tuple[str, ...],
+) -> list[str]:
+    for inventory_url in inventory_urls:
+        response = session.get(inventory_url, timeout=120)
+        if response.status_code != 200:
+            continue
+        lines = response.text.splitlines()
+        if not lines:
+            continue
+        first_line = lines[0].lstrip().lower()
+        if first_line.startswith("<!doctype html") or first_line.startswith("<?xml"):
+            continue
+        return lines
+    return []
 
 
 def find_inventory_range(lines: list[str], patterns: list[str]) -> tuple[int, int] | None:
@@ -282,8 +304,12 @@ def decode_grib_nearest_value(
         nearest = codes_grib_find_nearest(handle, latitude, longitude)
         if isinstance(nearest, (list, tuple)) and nearest:
             sample = nearest[0]
+            if hasattr(sample, "value"):
+                return float(sample.value)
             if isinstance(sample, dict) and "value" in sample:
                 return float(sample["value"])
+        if hasattr(nearest, "value"):
+            return float(nearest.value)
         if isinstance(nearest, dict) and "value" in nearest:
             return float(nearest["value"])
         raise RuntimeError("ecCodes did not return a nearest-point value.")
