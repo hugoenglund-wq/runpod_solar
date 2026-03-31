@@ -30,14 +30,34 @@ That installs:
 To build leakage-safe NOAA GFS training data for `d1-d3`:
 
 ```bash
-python scripts/download_noaa_gfs_point_archive.py --output-dir data
+python scripts/download_noaa_gfs_point_archive.py --output-dir data --workers 6
 ```
 
 This writes:
 
 - `data/raw/weather/noaa_gfs_hourly/weather_noaa_gfs_issue_valid.csv`
+- `data/raw/weather/noaa_gfs_hourly/chunks/*.csv`
 
 When that file exists, the training pipeline automatically prefers NOAA GFS for `d1-d3`.
+
+The downloader checkpoints each issue day into `chunks/`, so interrupted runs can resume.
+
+## RunPod Sizing
+
+For the NOAA backfill:
+
+- `4-8 vCPU` is a good target
+- `4 GB RAM` is usually enough
+- `8 GB RAM` is comfortable if you want headroom
+
+The NOAA downloader is mainly network-bound, so more than `8` workers usually gives diminishing returns.
+
+For full model training after the data is downloaded:
+
+- `8 vCPU`
+- `8-16 GB RAM`
+
+is a sensible starting point.
 
 ## Training
 

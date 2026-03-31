@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from pathlib import Path
 
@@ -35,6 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end-date", help="YYYY-MM-DD. Defaults to production end.")
     parser.add_argument("--issue-cycle-hour-utc", type=int, default=18)
     parser.add_argument("--output-dir", default="data")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(8, max(1, os.cpu_count() or 4)),
+        help="Parallel NOAA issue-day workers. Default: min(8, cpu_count).",
+    )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
@@ -52,6 +60,19 @@ def chunk_name_for_issue(issue_time_utc: datetime) -> str:
     return f"{issue_time_utc.strftime('%Y%m%dT%H%MZ')}.csv"
 
 
+def build_http_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": "runpod-solar-noaa-gfs-downloader/1.0"})
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=32,
+        pool_maxsize=32,
+        max_retries=2,
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 def read_and_normalize_production_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, sep=None, engine="python")
     expected = {"datetime", "power_w"}
@@ -62,6 +83,64 @@ def read_and_normalize_production_csv(path: Path) -> pd.DataFrame:
     df["datetime"] = pd.to_datetime(df["datetime"], errors="raise")
     df["power_w"] = pd.to_numeric(df["power_w"], errors="raise")
     return df.drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
+
+
+def process_issue_time(
+    *,
+    issue_time_utc: datetime,
+    chunk_path: Path,
+    latitude: float,
+    longitude: float,
+    timezone: str,
+) -> dict[str, object]:
+    session = build_http_session()
+    try:
+        discovered = discover_catalog_files_for_issue(session, issue_time_utc=issue_time_utc)
+        if not discovered:
+            return {"status": "missing", "issue_date": issue_time_utc.date().isoformat()}
+
+        available_leads = [item.lead_hours for item in discovered]
+        required_leads = required_leads_for_local_day_offsets(
+            issue_time_utc=issue_time_utc,
+            timezone=timezone,
+            day_offsets=(1, 2, 3),
+        )
+        selected = [item for item in discovered if item.lead_hours in required_leads]
+        if not selected:
+            return {"status": "missing", "issue_date": issue_time_utc.date().isoformat()}
+
+        print(
+            f"[download] NOAA GFS issue {issue_time_utc.isoformat()} "
+            f"available_leads={min(available_leads)}-{max(available_leads)} "
+            f"selected={len(selected)}",
+            flush=True,
+        )
+        issue_frame = extract_issue_point_forecast(
+            session,
+            catalog_files=selected,
+            latitude=latitude,
+            longitude=longitude,
+            timezone=timezone,
+        )
+        if issue_frame.empty:
+            return {"status": "empty", "issue_date": issue_time_utc.date().isoformat()}
+
+        tmp_path = chunk_path.with_suffix(".tmp")
+        issue_frame.to_csv(tmp_path, index=False)
+        tmp_path.replace(chunk_path)
+        return {
+            "status": "saved",
+            "chunk_name": chunk_path.name,
+            "rows": int(len(issue_frame)),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "error",
+            "issue_date": issue_time_utc.date().isoformat(),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        session.close()
 
 
 def main() -> int:
@@ -98,48 +177,47 @@ def main() -> int:
         if metadata_json.exists():
             metadata_json.unlink()
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": "runpod-solar-noaa-gfs-downloader/1.0"})
-
     missing_issue_dates: list[str] = []
+    error_issue_dates: list[dict[str, str]] = []
+    pending_jobs: list[tuple[datetime, Path]] = []
     for issue_time_utc in issue_times:
         chunk_path = chunks_dir / chunk_name_for_issue(issue_time_utc)
         if chunk_path.exists() and not args.force:
             print(f"[resume] NOAA GFS issue {issue_time_utc.isoformat()} chunk exists, skipping", flush=True)
             continue
+        pending_jobs.append((issue_time_utc, chunk_path))
 
-        discovered = discover_catalog_files_for_issue(session, issue_time_utc=issue_time_utc)
-        if not discovered:
-            missing_issue_dates.append(issue_time_utc.date().isoformat())
-            continue
-
-        available_leads = [item.lead_hours for item in discovered]
-        required_leads = required_leads_for_local_day_offsets(
-            issue_time_utc=issue_time_utc,
-            timezone=args.timezone,
-            day_offsets=(1, 2, 3),
-        )
-        selected = [item for item in discovered if item.lead_hours in required_leads]
-        if not selected:
-            missing_issue_dates.append(issue_time_utc.date().isoformat())
-            continue
-
-        print(
-            f"[download] NOAA GFS issue {issue_time_utc.isoformat()} "
-            f"available_leads={min(available_leads)}-{max(available_leads)} "
-            f"selected={len(selected)}",
-            flush=True,
-        )
-        issue_frame = extract_issue_point_forecast(
-            session,
-            catalog_files=selected,
-            latitude=args.latitude,
-            longitude=args.longitude,
-            timezone=args.timezone,
-        )
-        if not issue_frame.empty:
-            issue_frame.to_csv(chunk_path, index=False)
-            print(f"[saved] {chunk_path.name} rows={len(issue_frame)}", flush=True)
+    if pending_jobs:
+        print(f"[start] NOAA GFS backfill workers={args.workers} pending_issues={len(pending_jobs)}", flush=True)
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
+            future_map = {
+                executor.submit(
+                    process_issue_time,
+                    issue_time_utc=issue_time_utc,
+                    chunk_path=chunk_path,
+                    latitude=args.latitude,
+                    longitude=args.longitude,
+                    timezone=args.timezone,
+                ): issue_time_utc
+                for issue_time_utc, chunk_path in pending_jobs
+            }
+            for future in as_completed(future_map):
+                result = future.result()
+                status = result["status"]
+                if status in {"missing", "empty"}:
+                    missing_issue_dates.append(str(result["issue_date"]))
+                    continue
+                if status == "error":
+                    error_issue_dates.append(
+                        {"issue_date": str(result["issue_date"]), "error": str(result["error"])}
+                    )
+                    print(
+                        f"[error] NOAA GFS issue {result['issue_date']} failed: {result['error']}",
+                        flush=True,
+                    )
+                    continue
+                if status == "saved":
+                    print(f"[saved] {result['chunk_name']} rows={result['rows']}", flush=True)
 
     chunk_paths = [path for path in selected_chunk_paths if path.exists()]
     if not chunk_paths:
@@ -166,6 +244,7 @@ def main() -> int:
         "rows": int(len(combined)),
         "chunk_files": int(len(chunk_paths)),
         "missing_issue_dates": missing_issue_dates,
+        "error_issue_dates": error_issue_dates,
     }
     metadata_json.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"[ok] wrote {len(combined)} NOAA GFS rows to {output_csv}")
