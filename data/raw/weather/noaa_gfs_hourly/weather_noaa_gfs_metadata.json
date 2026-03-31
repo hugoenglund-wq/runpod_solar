@@ -1,0 +1,21 @@
+{
+  "source": "NOAA NCEI GFS archive",
+  "latitude": 57.704,
+  "longitude": 11.771,
+  "timezone": "Europe/Stockholm",
+  "issue_cycle_hour_utc": 18,
+  "coverage_start": "2021-01-01 19:00:00",
+  "coverage_end": "2024-04-05 23:00:00",
+  "rows": 85212,
+  "chunk_files": 1185,
+  "missing_issue_dates": [
+    "2021-02-06",
+    "2021-02-03"
+  ],
+  "error_issue_dates": [
+    {
+      "issue_date": "2022-11-29",
+      "error": "FunctionNotImplementedError: Function not yet implemented"
+    }
+  ]
+}
