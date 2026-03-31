@@ -48,6 +48,10 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+def chunk_name_for_issue(issue_time_utc: datetime) -> str:
+    return f"{issue_time_utc.strftime('%Y%m%dT%H%MZ')}.csv"
+
+
 def read_and_normalize_production_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, sep=None, engine="python")
     expected = {"datetime", "power_w"}
@@ -72,22 +76,38 @@ def main() -> int:
 
     output_dir = Path(args.output_dir)
     weather_dir = ensure_dir(output_dir / "raw" / "weather" / "noaa_gfs_hourly")
+    chunks_dir = ensure_dir(weather_dir / "chunks")
     output_csv = weather_dir / "weather_noaa_gfs_issue_valid.csv"
     metadata_json = weather_dir / "weather_noaa_gfs_metadata.json"
     if output_csv.exists() and not args.force:
         print(f"[skip] NOAA GFS archive already exists: {output_csv}")
         return 0
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": "runpod-solar-noaa-gfs-downloader/1.0"})
-
-    frames: list[pd.DataFrame] = []
-    missing_issue_dates: list[str] = []
-    for issue_time_utc in build_daily_issue_times(
+    issue_times = build_daily_issue_times(
         start_date=start_date,
         end_date=end_date,
         issue_cycle_hour_utc=args.issue_cycle_hour_utc,
-    ):
+    )
+    selected_chunk_paths = [chunks_dir / chunk_name_for_issue(issue_time_utc) for issue_time_utc in issue_times]
+    if args.force:
+        for chunk_path in selected_chunk_paths:
+            if chunk_path.exists():
+                chunk_path.unlink()
+        if output_csv.exists():
+            output_csv.unlink()
+        if metadata_json.exists():
+            metadata_json.unlink()
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "runpod-solar-noaa-gfs-downloader/1.0"})
+
+    missing_issue_dates: list[str] = []
+    for issue_time_utc in issue_times:
+        chunk_path = chunks_dir / chunk_name_for_issue(issue_time_utc)
+        if chunk_path.exists() and not args.force:
+            print(f"[resume] NOAA GFS issue {issue_time_utc.isoformat()} chunk exists, skipping", flush=True)
+            continue
+
         discovered = discover_catalog_files_for_issue(session, issue_time_utc=issue_time_utc)
         if not discovered:
             missing_issue_dates.append(issue_time_utc.date().isoformat())
@@ -118,14 +138,17 @@ def main() -> int:
             timezone=args.timezone,
         )
         if not issue_frame.empty:
-            frames.append(issue_frame)
+            issue_frame.to_csv(chunk_path, index=False)
+            print(f"[saved] {chunk_path.name} rows={len(issue_frame)}", flush=True)
 
-    if not frames:
+    chunk_paths = [path for path in selected_chunk_paths if path.exists()]
+    if not chunk_paths:
         raise RuntimeError(
             "NOAA GFS download did not produce any point forecasts. "
             "Check archive coverage and ecCodes availability."
         )
 
+    frames = [pd.read_csv(path, parse_dates=["forecast_issue_time", "forecast_valid_time"]) for path in chunk_paths]
     combined = pd.concat(frames, ignore_index=True).drop_duplicates(
         subset=["forecast_issue_time", "forecast_valid_time"]
     )
@@ -141,6 +164,7 @@ def main() -> int:
         "coverage_start": str(combined["forecast_issue_time"].min()),
         "coverage_end": str(combined["forecast_valid_time"].max()),
         "rows": int(len(combined)),
+        "chunk_files": int(len(chunk_paths)),
         "missing_issue_dates": missing_issue_dates,
     }
     metadata_json.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
