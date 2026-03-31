@@ -24,6 +24,7 @@ That installs:
 
 - Python dependencies from [requirements.txt](C:/Users/hugoe/Desktop/solar_google_collab/requirements.txt)
 - native `ecCodes` runtime for NOAA GFS GRIB decoding
+- `Python 3.11` in a local `.venv`
 - a verification step via [verify_noaa_runtime.py](C:/Users/hugoe/Desktop/solar_google_collab/scripts/verify_noaa_runtime.py)
 
 ## NOAA GFS Backfill

@@ -3,7 +3,7 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN="${PYTHON_BIN:-python3.11}"
 VENV_DIR="${VENV_DIR:-.venv}"
 
 echo "[1/4] Updating apt metadata"
@@ -15,9 +15,8 @@ apt-get install -y --no-install-recommends \
   curl \
   build-essential \
   libeccodes-dev \
-  python3 \
-  python3-pip \
-  python3-venv
+  python3.11 \
+  python3.11-venv
 
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   echo "Python interpreter not found: ${PYTHON_BIN}" >&2
