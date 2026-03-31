@@ -93,6 +93,7 @@ def main() -> int:
             missing_issue_dates.append(issue_time_utc.date().isoformat())
             continue
 
+        available_leads = [item.lead_hours for item in discovered]
         required_leads = required_leads_for_local_day_offsets(
             issue_time_utc=issue_time_utc,
             timezone=args.timezone,
@@ -104,7 +105,9 @@ def main() -> int:
             continue
 
         print(
-            f"[download] NOAA GFS issue {issue_time_utc.isoformat()} with {len(selected)} lead files",
+            f"[download] NOAA GFS issue {issue_time_utc.isoformat()} "
+            f"available_leads={min(available_leads)}-{max(available_leads)} "
+            f"selected={len(selected)}",
             flush=True,
         )
         issue_frame = extract_issue_point_forecast(

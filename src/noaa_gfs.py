@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import io
 import re
+import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -66,6 +66,7 @@ def discover_catalog_files_for_issue(
     ymd = issue_time_utc.strftime("%Y%m%d")
     issue_hour = issue_time_utc.strftime("%H")
 
+    candidate_sets: list[list[CatalogFile]] = []
     for dataset_root in dataset_roots:
         catalog_url = f"{NOAA_THREDDS_CATALOG}/{dataset_root}/{year_month}/{ymd}/catalog.xml"
         response = session.get(catalog_url, timeout=120)
@@ -89,9 +90,19 @@ def discover_catalog_files_for_issue(
                 )
             )
         if files:
-            return sorted(files, key=lambda item: item.lead_hours)
+            candidate_sets.append(sorted(files, key=lambda item: item.lead_hours))
 
-    return []
+    if not candidate_sets:
+        return []
+
+    candidate_sets.sort(
+        key=lambda items: (
+            max(item.lead_hours for item in items),
+            len(items),
+        ),
+        reverse=True,
+    )
+    return candidate_sets[0]
 
 
 def required_leads_for_local_day_offsets(
@@ -254,20 +265,24 @@ def decode_grib_nearest_value(
             "NOAA GFS extraction requires the 'eccodes' Python package plus the ecCodes C library."
         ) from exc
 
-    handle = codes_grib_new_from_file(io.BytesIO(content))
-    if handle is None:
-        raise RuntimeError("Failed to decode GRIB message for NOAA GFS record.")
-    try:
-        nearest = codes_grib_find_nearest(handle, latitude, longitude)
-        if isinstance(nearest, (list, tuple)) and nearest:
-            sample = nearest[0]
-            if isinstance(sample, dict) and "value" in sample:
-                return float(sample["value"])
-        if isinstance(nearest, dict) and "value" in nearest:
-            return float(nearest["value"])
-        raise RuntimeError("ecCodes did not return a nearest-point value.")
-    finally:
-        codes_release(handle)
+    with tempfile.NamedTemporaryFile(suffix=".grib2") as tmp:
+        tmp.write(content)
+        tmp.flush()
+        tmp.seek(0)
+        handle = codes_grib_new_from_file(tmp)
+        if handle is None:
+            raise RuntimeError("Failed to decode GRIB message for NOAA GFS record.")
+        try:
+            nearest = codes_grib_find_nearest(handle, latitude, longitude)
+            if isinstance(nearest, (list, tuple)) and nearest:
+                sample = nearest[0]
+                if isinstance(sample, dict) and "value" in sample:
+                    return float(sample["value"])
+            if isinstance(nearest, dict) and "value" in nearest:
+                return float(nearest["value"])
+            raise RuntimeError("ecCodes did not return a nearest-point value.")
+        finally:
+            codes_release(handle)
 
 
 def _to_local_naive(ts_utc: datetime, timezone: str) -> datetime:
