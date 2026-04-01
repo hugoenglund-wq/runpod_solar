@@ -15,7 +15,12 @@ from src.data_loader import (
     load_system_metadata,
     load_weather_history_frame,
 )
-from src.day_features import DEFAULT_FEATURE_CONFIG, add_timestamp_features, build_issue_feature_frame
+from src.day_features import (
+    DEFAULT_FEATURE_CONFIG,
+    add_relative_physics_features,
+    add_timestamp_features,
+    build_issue_feature_frame,
+)
 
 
 DAILY_ISSUE_HOUR = 23
@@ -69,7 +74,9 @@ def build_day_model_frame(
 ) -> pd.DataFrame:
     paths = paths or default_project_paths()
     metadata = metadata or load_system_metadata(paths)
-    use_noaa_gfs = bool(spec.use_forecast_archive and paths.weather_noaa_gfs_issue_valid_csv.exists())
+    has_noaa_gfs = paths.weather_noaa_gfs_issue_valid_csv.exists()
+    use_noaa_gfs = bool(spec.use_forecast_archive and has_noaa_gfs)
+    use_intraday_forecast = bool(spec.day_offset == 0 and has_noaa_gfs)
 
     production = load_production_frame(paths, complete_index=True)
     weather_history = load_weather_history_frame(paths)
@@ -88,10 +95,7 @@ def build_day_model_frame(
         how="left",
     ).drop(columns=["timestamp"])
 
-    if use_noaa_gfs:
-        noaa_issue_times = load_noaa_gfs_forecast_frame(paths)["forecast_issue_time"].drop_duplicates()
-        issue_frame = issue_frame.loc[issue_frame["origin_time"].isin(noaa_issue_times)].copy()
-    elif spec.issue_schedule == "daily_23_45":
+    if spec.issue_schedule == "daily_23_45":
         issue_frame = issue_frame.loc[
             (issue_frame["origin_time"].dt.hour == DAILY_ISSUE_HOUR)
             & (issue_frame["origin_time"].dt.minute == DAILY_ISSUE_MINUTE)
@@ -143,18 +147,22 @@ def build_day_model_frame(
         (expanded["origin_time"].dt.normalize() + pd.Timedelta(days=1)) - expanded["origin_time"]
     ).dt.total_seconds() / 60.0
 
-    if spec.use_forecast_archive:
+    if spec.use_forecast_archive or use_intraday_forecast:
         expanded = _merge_target_forecast_features(
             expanded,
             paths=paths,
             day_offset=spec.day_offset,
-            use_noaa_gfs=use_noaa_gfs,
+            use_noaa_gfs=has_noaa_gfs,
         )
         if expanded.empty:
             return expanded
         expanded = _add_daily_forecast_aggregates(expanded)
 
     expanded = _add_baselines(expanded, production)
+    expanded = add_relative_physics_features(
+        expanded,
+        system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
+    )
     expanded["model_name"] = spec.name
     expanded["issue_schedule"] = spec.issue_schedule
     return expanded.reset_index(drop=True)
@@ -228,6 +236,9 @@ def _merge_target_forecast_features(
     out["forecast_source_time"] = out["forecast_valid_hour"] - pd.to_timedelta(day_offset, unit="D")
     out = out.merge(forecast, on="forecast_valid_hour", how="left")
     out["forecast_available_at_origin"] = out["forecast_source_time"] <= out["origin_time"]
+    out["forecast_issue_age_hours_at_origin"] = (
+        out["origin_time"] - out["forecast_source_time"]
+    ).dt.total_seconds() / 3600.0
 
     required_cols = [col for col in out.columns if col.startswith("target_fcst_")]
     out = out.loc[out["forecast_available_at_origin"]].copy()
@@ -262,13 +273,23 @@ def _merge_noaa_gfs_target_forecast_features(
     ]
     out = frame.copy()
     out["forecast_valid_hour"] = out["target_time"].dt.floor("h")
-    out = out.merge(
-        noaa.loc[:, selected_cols],
-        left_on=["origin_time", "forecast_valid_hour"],
-        right_on=["forecast_issue_time", "forecast_valid_hour"],
-        how="left",
+    left = out.sort_values(["forecast_valid_hour", "origin_time"]).reset_index(drop=True)
+    right = noaa.loc[:, selected_cols].sort_values(["forecast_valid_hour", "forecast_issue_time"]).reset_index(
+        drop=True
+    )
+    out = pd.merge_asof(
+        left,
+        right,
+        left_on="origin_time",
+        right_on="forecast_issue_time",
+        by="forecast_valid_hour",
+        direction="backward",
+        allow_exact_matches=True,
     )
     out["forecast_available_at_origin"] = out["forecast_valid_time"].notna()
+    out["forecast_issue_age_hours_at_origin"] = (
+        out["origin_time"] - out["forecast_issue_time"]
+    ).dt.total_seconds() / 3600.0
     required_cols = [col for col in rename_map.values() if col in out.columns]
     out = out.loc[out["forecast_available_at_origin"]].copy()
     out = out.dropna(axis="index", how="any", subset=required_cols)

@@ -22,6 +22,7 @@ from src.evaluate import (
     evaluate_prediction_frame,
 )
 from src.models import ModelConfig, fit_regressor, predict_regressor
+from src.models import fit_segmented_regressor
 from src.splits import (
     BacktestConfig,
     build_issue_date_backtest_folds,
@@ -35,7 +36,7 @@ class TrainConfig:
     evaluation_fraction: float = 0.20
     max_folds: int = 8
     preferred_window_days: int = 30
-    min_train_issue_days: int = 60
+    min_train_issue_days: int = 365
     min_train_rows: int = 500
     min_val_rows: int = 100
     start_date: str | None = None
@@ -107,12 +108,14 @@ def train_single_model(
     folds = build_issue_date_backtest_folds(frame, config=backtest_cfg)
 
     first_train, first_val = split_frame_for_fold(frame, folds[0])
+    use_segmented_model = bool(spec.day_offset == 0 and "lead_bucket_code" in frame.columns)
     selected_backend = choose_backend(
         spec=spec,
         train_df=first_train,
         val_df=first_val,
         random_state=train_config.random_state,
         system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
+        segmented=use_segmented_model,
     )
 
     model_dir = ensure_dir(artifacts_dir / "models" / spec.name)
@@ -133,14 +136,24 @@ def train_single_model(
 
         X_train, y_train, _, feature_cols = prepare_model_matrix(train_df)
         X_val, _, meta_val, _ = prepare_model_matrix(val_df)
-        model = fit_regressor(
-            X_train,
-            y_train,
-            config=ModelConfig(
-                random_state=train_config.random_state,
-                backend=selected_backend,
-            ),
+        model_config = ModelConfig(
+            random_state=train_config.random_state,
+            backend=selected_backend,
         )
+        if use_segmented_model:
+            model = fit_segmented_regressor(
+                X_train,
+                y_train,
+                segment_col="lead_bucket_code",
+                config=model_config,
+                min_segment_rows=max(500, train_config.min_train_rows),
+            )
+        else:
+            model = fit_regressor(
+                X_train,
+                y_train,
+                config=model_config,
+            )
         y_pred = clip_physical_predictions(
             predict_regressor(model, X_val),
             system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
@@ -228,14 +241,24 @@ def train_single_model(
         )
 
     X_full, y_full, _, feature_cols = prepare_model_matrix(frame)
-    final_model = fit_regressor(
-        X_full,
-        y_full,
-        config=ModelConfig(
-            random_state=train_config.random_state,
-            backend=selected_backend,
-        ),
+    final_model_config = ModelConfig(
+        random_state=train_config.random_state,
+        backend=selected_backend,
     )
+    if use_segmented_model:
+        final_model = fit_segmented_regressor(
+            X_full,
+            y_full,
+            segment_col="lead_bucket_code",
+            config=final_model_config,
+            min_segment_rows=max(2_000, train_config.min_train_rows),
+        )
+    else:
+        final_model = fit_regressor(
+            X_full,
+            y_full,
+            config=final_model_config,
+        )
 
     model_path = model_dir / "model.joblib"
     model_meta = {
@@ -246,6 +269,7 @@ def train_single_model(
         "selected_backend_request": selected_backend,
         "feature_columns": feature_cols,
         "daylight_only_targets": True,
+        "segmented_by": "lead_bucket_code" if use_segmented_model else None,
         "season_coverage": season_coverage,
         "warnings": warnings,
     }
@@ -311,26 +335,36 @@ def choose_backend(
     val_df: pd.DataFrame,
     random_state: int,
     system_capacity_w: float,
+    segmented: bool,
 ) -> str:
-    if spec.day_offset == 0:
-        return "lightgbm"
-
     candidates = ["xgboost", "lightgbm"]
     results: list[tuple[str, float]] = []
-    X_train, y_train, _, _ = prepare_model_matrix(train_df)
-    X_val, _, _, _ = prepare_model_matrix(val_df)
+    train_sample = _sample_frame_for_backend_selection(train_df, max_rows=250_000)
+    val_sample = _sample_frame_for_backend_selection(val_df, max_rows=100_000)
+    X_train, y_train, _, _ = prepare_model_matrix(train_sample)
+    X_val, _, _, _ = prepare_model_matrix(val_sample)
     for backend in candidates:
-        model = fit_regressor(
-            X_train,
-            y_train,
-            config=ModelConfig(random_state=random_state, backend=backend),
-        )
+        model_config = ModelConfig(random_state=random_state, backend=backend)
+        if segmented and "lead_bucket_code" in X_train.columns:
+            model = fit_segmented_regressor(
+                X_train,
+                y_train,
+                segment_col="lead_bucket_code",
+                config=model_config,
+                min_segment_rows=max(250, int(len(X_train) * 0.01)),
+            )
+        else:
+            model = fit_regressor(
+                X_train,
+                y_train,
+                config=model_config,
+            )
         y_pred = clip_physical_predictions(
             predict_regressor(model, X_val),
             system_capacity_w=system_capacity_w,
         )
         metrics = evaluate_prediction_frame(
-            val_df,
+            val_sample,
             y_pred,
             baseline_col="baseline_previous_day_power_w",
             system_capacity_w=system_capacity_w,
@@ -342,6 +376,12 @@ def choose_backend(
 
     results = sorted(results, key=lambda item: item[1])
     return results[0][0]
+
+
+def _sample_frame_for_backend_selection(frame: pd.DataFrame, *, max_rows: int) -> pd.DataFrame:
+    if len(frame) <= max_rows:
+        return frame
+    return frame.sample(n=max_rows, random_state=42).sort_values("origin_time").reset_index(drop=True)
 
 
 def filter_date_range(

@@ -23,6 +23,9 @@ QUICK_TEST_FEATURE_CONFIG = FeatureConfig(
     rolling_windows=(4, 16),
 )
 
+MIN_CLEAR_SKY_PROXY_W = 250.0
+LEAD_BUCKET_BOUNDS_HOURS = (1.0, 3.0, 6.0)
+
 
 def build_issue_feature_frame(
     issue_frame: pd.DataFrame,
@@ -79,6 +82,42 @@ def add_target_features(
     out["remaining_day_minutes_at_issue"] = (
         (out["origin_time"].dt.normalize() + pd.Timedelta(days=1)) - out["origin_time"]
     ).dt.total_seconds() / 60.0
+    return out
+
+
+def add_relative_physics_features(
+    frame: pd.DataFrame,
+    *,
+    system_capacity_w: float,
+) -> pd.DataFrame:
+    out = frame.copy()
+
+    if "origin_clear_sky_power_proxy_w" in out.columns:
+        origin_norm = _safe_clear_sky_normalizer(out["origin_clear_sky_power_proxy_w"])
+        out["origin_power_clear_sky_ratio"] = out["power_w"] / origin_norm
+
+    if "target_clear_sky_power_proxy_w" in out.columns:
+        target_norm = _safe_clear_sky_normalizer(out["target_clear_sky_power_proxy_w"])
+        if "baseline_previous_day_power_w" in out.columns:
+            out["baseline_previous_day_clear_sky_ratio"] = out["baseline_previous_day_power_w"] / target_norm
+        if "baseline_previous_week_power_w" in out.columns:
+            out["baseline_previous_week_clear_sky_ratio"] = out["baseline_previous_week_power_w"] / target_norm
+        if system_capacity_w > 0:
+            out["target_clear_sky_capacity_ratio"] = out["target_clear_sky_power_proxy_w"] / system_capacity_w
+
+    if "hist_shortwave_radiation" in out.columns and "origin_solar_cos_zenith" in out.columns:
+        solar_norm = np.maximum(out["origin_solar_cos_zenith"].to_numpy(dtype=float), 0.05)
+        out["origin_shortwave_cos_ratio"] = out["hist_shortwave_radiation"].to_numpy(dtype=float) / solar_norm
+
+    if "lead_hours" in out.columns:
+        lead_hours = out["lead_hours"].to_numpy(dtype=float)
+        out["lead_bucket_code"] = _compute_lead_bucket_codes(lead_hours)
+        out["is_short_lead"] = (lead_hours <= LEAD_BUCKET_BOUNDS_HOURS[0]).astype(int)
+        out["is_medium_lead"] = (
+            (lead_hours > LEAD_BUCKET_BOUNDS_HOURS[0]) & (lead_hours <= LEAD_BUCKET_BOUNDS_HOURS[2])
+        ).astype(int)
+        out["is_long_lead"] = (lead_hours > LEAD_BUCKET_BOUNDS_HOURS[2]).astype(int)
+
     return out
 
 
@@ -153,6 +192,19 @@ def _add_issue_history_features(
         out[f"roll_max_power_{window}"] = rolled.max()
         out[f"roll_std_power_{window}"] = rolled.std()
         out[f"roll_sum_power_{window}"] = rolled.sum()
+
+    for ramp_lag in (1, 4, 16):
+        lag_col = f"lag_power_{ramp_lag}"
+        if lag_col in out.columns:
+            out[f"ramp_power_{ramp_lag}"] = out["power_w"] - out[lag_col]
+
+    for weather_col in ("hist_cloud_cover", "hist_shortwave_radiation", "hist_temperature_2m"):
+        if weather_col not in out.columns:
+            continue
+        shifted_weather = out[weather_col].shift(1)
+        out[f"{weather_col}_roll_mean_4"] = shifted_weather.rolling(window=4, min_periods=1).mean()
+        out[f"{weather_col}_delta_1"] = out[weather_col] - out[weather_col].shift(1)
+        out[f"{weather_col}_delta_4"] = out[weather_col] - out[weather_col].shift(4)
 
     out["power_kw"] = out["power_w"] / 1000.0
     if system_capacity_w > 0:
@@ -288,3 +340,12 @@ def prepare_model_matrix(
     y = work[target_col].astype(float).copy()
     meta = work.loc[:, [col for col in meta_cols if col in work.columns]].copy()
     return X, y, meta, numeric_feature_cols
+
+
+def _safe_clear_sky_normalizer(series: pd.Series) -> np.ndarray:
+    values = np.asarray(series, dtype=float)
+    return np.maximum(values, MIN_CLEAR_SKY_PROXY_W)
+
+
+def _compute_lead_bucket_codes(lead_hours: np.ndarray) -> np.ndarray:
+    return np.digitize(np.asarray(lead_hours, dtype=float), bins=np.asarray(LEAD_BUCKET_BOUNDS_HOURS), right=True)

@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-train-issue-days",
         type=int,
-        default=60,
+        default=365,
         help="Minimum number of issue days required before the first validation fold.",
     )
     parser.add_argument(
