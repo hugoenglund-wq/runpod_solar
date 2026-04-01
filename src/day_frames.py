@@ -288,7 +288,10 @@ def _merge_noaa_gfs_target_forecast_features(
             left_empty = left_part.copy()
             for col in selected_cols:
                 if col not in left_empty.columns:
-                    left_empty[col] = pd.NA
+                    if col in {"forecast_issue_time", "forecast_valid_time"}:
+                        left_empty[col] = pd.NaT
+                    else:
+                        left_empty[col] = pd.NA
             merged_parts.append(left_empty)
             continue
 
@@ -306,6 +309,8 @@ def _merge_noaa_gfs_target_forecast_features(
     if not merged_parts:
         return pd.DataFrame()
     out = pd.concat(merged_parts, ignore_index=True)
+    out["forecast_issue_time"] = pd.to_datetime(out["forecast_issue_time"], errors="coerce")
+    out["forecast_valid_time"] = pd.to_datetime(out["forecast_valid_time"], errors="coerce")
     out["forecast_available_at_origin"] = out["forecast_valid_time"].notna()
     out["forecast_issue_age_hours_at_origin"] = (
         out["origin_time"] - out["forecast_issue_time"]
