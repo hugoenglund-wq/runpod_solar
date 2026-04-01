@@ -277,15 +277,35 @@ def _merge_noaa_gfs_target_forecast_features(
     right = noaa.loc[:, selected_cols].sort_values(["forecast_valid_hour", "forecast_issue_time"]).reset_index(
         drop=True
     )
-    out = pd.merge_asof(
-        left,
-        right,
-        left_on="origin_time",
-        right_on="forecast_issue_time",
-        by="forecast_valid_hour",
-        direction="backward",
-        allow_exact_matches=True,
-    )
+    merged_parts: list[pd.DataFrame] = []
+    right_groups = {
+        forecast_valid_hour: part.sort_values("forecast_issue_time").reset_index(drop=True)
+        for forecast_valid_hour, part in right.groupby("forecast_valid_hour", sort=False)
+    }
+    for forecast_valid_hour, left_part in left.groupby("forecast_valid_hour", sort=False):
+        right_part = right_groups.get(forecast_valid_hour)
+        if right_part is None or right_part.empty:
+            left_empty = left_part.copy()
+            for col in selected_cols:
+                if col not in left_empty.columns:
+                    left_empty[col] = pd.NA
+            merged_parts.append(left_empty)
+            continue
+
+        merged_parts.append(
+            pd.merge_asof(
+                left_part.sort_values("origin_time").reset_index(drop=True),
+                right_part,
+                left_on="origin_time",
+                right_on="forecast_issue_time",
+                direction="backward",
+                allow_exact_matches=True,
+            )
+        )
+
+    if not merged_parts:
+        return pd.DataFrame()
+    out = pd.concat(merged_parts, ignore_index=True)
     out["forecast_available_at_origin"] = out["forecast_valid_time"].notna()
     out["forecast_issue_age_hours_at_origin"] = (
         out["origin_time"] - out["forecast_issue_time"]
