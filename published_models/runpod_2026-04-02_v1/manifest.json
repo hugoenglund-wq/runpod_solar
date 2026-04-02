@@ -1,0 +1,92 @@
+{
+  "snapshot_name": "runpod_2026-04-02_v1",
+  "created_at_utc": "2026-04-02T11:44:47.423504+00:00",
+  "source_artifacts_dir": "/workspace/artifacts",
+  "repo_destination": "/workspace/runpod_solar/published_models/runpod_2026-04-02_v1",
+  "copied_files": [
+    {
+      "relative_path": "models/day_0/model.joblib",
+      "bytes": 54699990
+    },
+    {
+      "relative_path": "models/day_1/model.joblib",
+      "bytes": 2872050
+    },
+    {
+      "relative_path": "models/day_2/model.joblib",
+      "bytes": 2871300
+    },
+    {
+      "relative_path": "models/day_3/model.joblib",
+      "bytes": 9428661
+    },
+    {
+      "relative_path": "metrics/all_models_metrics.csv",
+      "bytes": 921
+    },
+    {
+      "relative_path": "metrics/day_0_fold_metrics.csv",
+      "bytes": 1359
+    },
+    {
+      "relative_path": "metrics/day_0_lead_bucket_metrics.csv",
+      "bytes": 690
+    },
+    {
+      "relative_path": "metrics/day_0_metrics.json",
+      "bytes": 9120
+    },
+    {
+      "relative_path": "metrics/day_0_seasonal_metrics.csv",
+      "bytes": 1667
+    },
+    {
+      "relative_path": "metrics/day_1_fold_metrics.csv",
+      "bytes": 1276
+    },
+    {
+      "relative_path": "metrics/day_1_lead_bucket_metrics.csv",
+      "bytes": 397
+    },
+    {
+      "relative_path": "metrics/day_1_metrics.json",
+      "bytes": 8720
+    },
+    {
+      "relative_path": "metrics/day_1_seasonal_metrics.csv",
+      "bytes": 1645
+    },
+    {
+      "relative_path": "metrics/day_2_fold_metrics.csv",
+      "bytes": 1271
+    },
+    {
+      "relative_path": "metrics/day_2_lead_bucket_metrics.csv",
+      "bytes": 252
+    },
+    {
+      "relative_path": "metrics/day_2_metrics.json",
+      "bytes": 8360
+    },
+    {
+      "relative_path": "metrics/day_2_seasonal_metrics.csv",
+      "bytes": 1651
+    },
+    {
+      "relative_path": "metrics/day_3_fold_metrics.csv",
+      "bytes": 1267
+    },
+    {
+      "relative_path": "metrics/day_3_lead_bucket_metrics.csv",
+      "bytes": 252
+    },
+    {
+      "relative_path": "metrics/day_3_metrics.json",
+      "bytes": 8358
+    },
+    {
+      "relative_path": "metrics/day_3_seasonal_metrics.csv",
+      "bytes": 1643
+    }
+  ]
+}
