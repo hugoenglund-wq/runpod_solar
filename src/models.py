@@ -27,6 +27,7 @@ class FittedModel:
 class SegmentedFittedModel:
     backend: str
     segment_col: str
+    segment_backends: dict[int, str]
     segment_models: dict[int, FittedModel]
     fallback_model: FittedModel
 
@@ -80,6 +81,7 @@ def fit_segmented_regressor(
     segment_col: str,
     config: ModelConfig = ModelConfig(),
     min_segment_rows: int = 1_000,
+    segment_backend_overrides: dict[int, str] | None = None,
 ) -> SegmentedFittedModel:
     if segment_col not in X_train.columns:
         raise ValueError(f"Segment column not found in training matrix: {segment_col}")
@@ -96,17 +98,34 @@ def fit_segmented_regressor(
     )
 
     fallback_model = fit_regressor(X_train, y_train, config=base_config)
+    segment_backend_overrides = segment_backend_overrides or {}
+    segment_backends: dict[int, str] = {}
     segment_models: dict[int, FittedModel] = {}
     for segment_value, segment_index in X_train.groupby(segment_col, sort=True).groups.items():
         if len(segment_index) < min_segment_rows:
             continue
+        segment_backend = segment_backend_overrides.get(int(segment_value), base_backend)
+        segment_config = ModelConfig(
+            random_state=config.random_state,
+            max_iter=config.max_iter,
+            learning_rate=config.learning_rate,
+            max_depth=config.max_depth,
+            backend=segment_backend,
+        )
         X_part = X_train.loc[segment_index].copy()
         y_part = y_train.loc[segment_index].copy()
-        segment_models[int(segment_value)] = fit_regressor(X_part, y_part, config=base_config)
+        segment_value_int = int(segment_value)
+        segment_models[segment_value_int] = fit_regressor(X_part, y_part, config=segment_config)
+        segment_backends[segment_value_int] = segment_models[segment_value_int].backend
 
+    unique_backends = sorted(set(segment_backends.values()) | {fallback_model.backend})
+    segmented_backend_name = (
+        f"segmented_{unique_backends[0]}" if len(unique_backends) == 1 else "segmented_mixed"
+    )
     return SegmentedFittedModel(
-        backend=f"segmented_{fallback_model.backend}",
+        backend=segmented_backend_name,
         segment_col=segment_col,
+        segment_backends=segment_backends,
         segment_models=segment_models,
         fallback_model=fallback_model,
     )

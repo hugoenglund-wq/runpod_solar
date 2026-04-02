@@ -109,14 +109,23 @@ def train_single_model(
 
     first_train, first_val = split_frame_for_fold(frame, folds[0])
     use_segmented_model = bool(spec.day_offset == 0 and "lead_bucket_code" in frame.columns)
-    selected_backend = choose_backend(
-        spec=spec,
-        train_df=first_train,
-        val_df=first_val,
-        random_state=train_config.random_state,
-        system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
-        segmented=use_segmented_model,
-    )
+    segment_backend_overrides: dict[int, str] = {}
+    if use_segmented_model:
+        selected_backend, segment_backend_overrides = choose_segmented_backends(
+            train_df=first_train,
+            val_df=first_val,
+            random_state=train_config.random_state,
+            system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
+        )
+    else:
+        selected_backend = choose_backend(
+            spec=spec,
+            train_df=first_train,
+            val_df=first_val,
+            random_state=train_config.random_state,
+            system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
+            segmented=False,
+        )
 
     model_dir = ensure_dir(artifacts_dir / "models" / spec.name)
     metrics_dir = ensure_dir(artifacts_dir / "metrics")
@@ -147,6 +156,7 @@ def train_single_model(
                 segment_col="lead_bucket_code",
                 config=model_config,
                 min_segment_rows=max(500, train_config.min_train_rows),
+                segment_backend_overrides=segment_backend_overrides,
             )
         else:
             model = fit_regressor(
@@ -214,6 +224,15 @@ def train_single_model(
 
     validation_backtest = pd.concat(validation_frames, ignore_index=True)
     seasonal_metrics_all = pd.concat(seasonal_metric_frames, ignore_index=True)
+    lead_bucket_metrics = pd.DataFrame()
+    if "lead_bucket_label" in validation_backtest.columns:
+        lead_bucket_metrics = evaluate_by_group(
+            validation_backtest,
+            validation_backtest["y_pred"].to_numpy(),
+            group_col="lead_bucket_label",
+            baseline_col="baseline_previous_day_power_w",
+            system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
+        )
     overall_backtest_metrics = evaluate_prediction_frame(
         validation_backtest,
         validation_backtest["y_pred"].to_numpy(),
@@ -252,6 +271,7 @@ def train_single_model(
             segment_col="lead_bucket_code",
             config=final_model_config,
             min_segment_rows=max(2_000, train_config.min_train_rows),
+            segment_backend_overrides=segment_backend_overrides,
         )
     else:
         final_model = fit_regressor(
@@ -267,6 +287,7 @@ def train_single_model(
         "issue_schedule": spec.issue_schedule,
         "backend": final_model.backend,
         "selected_backend_request": selected_backend,
+        "segment_backends": getattr(final_model, "segment_backends", None),
         "feature_columns": feature_cols,
         "daylight_only_targets": True,
         "segmented_by": "lead_bucket_code" if use_segmented_model else None,
@@ -294,6 +315,8 @@ def train_single_model(
     )
     pd.DataFrame(fold_metric_rows).to_csv(metrics_dir / f"{spec.name}_fold_metrics.csv", index=False)
     seasonal_metrics_all.to_csv(metrics_dir / f"{spec.name}_seasonal_metrics.csv", index=False)
+    if not lead_bucket_metrics.empty:
+        lead_bucket_metrics.to_csv(metrics_dir / f"{spec.name}_lead_bucket_metrics.csv", index=False)
 
     metrics_payload = {
         "model": model_meta,
@@ -303,6 +326,7 @@ def train_single_model(
         "backtest_overall_vs_persistence": persistence_backtest_metrics,
         "backtest_overall_vs_weekly": weekly_backtest_metrics,
         "fold_metrics": fold_metric_rows,
+        "lead_bucket_metrics": lead_bucket_metrics.to_dict(orient="records") if not lead_bucket_metrics.empty else [],
         "season_coverage": season_coverage,
         "warnings": warnings,
     }
@@ -376,6 +400,82 @@ def choose_backend(
 
     results = sorted(results, key=lambda item: item[1])
     return results[0][0]
+
+
+def choose_segmented_backends(
+    *,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    random_state: int,
+    system_capacity_w: float,
+) -> tuple[str, dict[int, str]]:
+    candidate_backends = ["xgboost", "lightgbm", "sklearn_hist_gradient_boosting"]
+    fallback_train = _sample_frame_for_backend_selection(train_df, max_rows=300_000)
+    fallback_val = _sample_frame_for_backend_selection(val_df, max_rows=120_000)
+    X_train, y_train, _, _ = prepare_model_matrix(fallback_train)
+    X_val, _, _, _ = prepare_model_matrix(fallback_val)
+
+    fallback_results: list[tuple[str, float]] = []
+    for backend in candidate_backends:
+        model = fit_regressor(
+            X_train,
+            y_train,
+            config=ModelConfig(random_state=random_state, backend=backend),
+        )
+        y_pred = clip_physical_predictions(
+            predict_regressor(model, X_val),
+            system_capacity_w=system_capacity_w,
+        )
+        metrics = evaluate_prediction_frame(
+            fallback_val,
+            y_pred,
+            baseline_col="baseline_previous_day_power_w",
+            system_capacity_w=system_capacity_w,
+        )
+        fallback_results.append((model.backend, float(metrics["mae_w"])))
+
+    fallback_results.sort(key=lambda item: item[1])
+    fallback_backend = fallback_results[0][0] if fallback_results else "auto"
+
+    segment_backends: dict[int, str] = {}
+    if "lead_bucket_code" not in train_df.columns or "lead_bucket_code" not in val_df.columns:
+        return fallback_backend, segment_backends
+
+    for segment_value in sorted(train_df["lead_bucket_code"].dropna().unique()):
+        train_part = train_df.loc[train_df["lead_bucket_code"] == segment_value].copy()
+        val_part = val_df.loc[val_df["lead_bucket_code"] == segment_value].copy()
+        if len(train_part) < 1_000 or len(val_part) < 250:
+            continue
+
+        train_part = _sample_frame_for_backend_selection(train_part, max_rows=150_000)
+        val_part = _sample_frame_for_backend_selection(val_part, max_rows=60_000)
+        X_train, y_train, _, _ = prepare_model_matrix(train_part)
+        X_val, _, _, _ = prepare_model_matrix(val_part)
+
+        results: list[tuple[str, float]] = []
+        for backend in candidate_backends:
+            model = fit_regressor(
+                X_train,
+                y_train,
+                config=ModelConfig(random_state=random_state, backend=backend),
+            )
+            y_pred = clip_physical_predictions(
+                predict_regressor(model, X_val),
+                system_capacity_w=system_capacity_w,
+            )
+            metrics = evaluate_prediction_frame(
+                val_part,
+                y_pred,
+                baseline_col="baseline_previous_day_power_w",
+                system_capacity_w=system_capacity_w,
+            )
+            results.append((model.backend, float(metrics["mae_w"])))
+
+        if results:
+            results.sort(key=lambda item: item[1])
+            segment_backends[int(segment_value)] = results[0][0]
+
+    return fallback_backend, segment_backends
 
 
 def _sample_frame_for_backend_selection(frame: pd.DataFrame, *, max_rows: int) -> pd.DataFrame:

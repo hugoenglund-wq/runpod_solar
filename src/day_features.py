@@ -25,6 +25,12 @@ QUICK_TEST_FEATURE_CONFIG = FeatureConfig(
 
 MIN_CLEAR_SKY_PROXY_W = 250.0
 LEAD_BUCKET_BOUNDS_HOURS = (1.0, 3.0, 6.0)
+LEAD_BUCKET_LABELS = {
+    0: "0_1h",
+    1: "1_3h",
+    2: "3_6h",
+    3: "6h_plus",
+}
 
 
 def build_issue_feature_frame(
@@ -112,6 +118,7 @@ def add_relative_physics_features(
     if "lead_hours" in out.columns:
         lead_hours = out["lead_hours"].to_numpy(dtype=float)
         out["lead_bucket_code"] = _compute_lead_bucket_codes(lead_hours)
+        out["lead_bucket_label"] = pd.Series(out["lead_bucket_code"]).map(LEAD_BUCKET_LABELS).fillna("unknown")
         out["is_short_lead"] = (lead_hours <= LEAD_BUCKET_BOUNDS_HOURS[0]).astype(int)
         out["is_medium_lead"] = (
             (lead_hours > LEAD_BUCKET_BOUNDS_HOURS[0]) & (lead_hours <= LEAD_BUCKET_BOUNDS_HOURS[2])
@@ -329,6 +336,8 @@ def prepare_model_matrix(
     ]
     if "forecast_available_at_origin" in work.columns:
         meta_cols.append("forecast_available_at_origin")
+    if "lead_bucket_label" in work.columns:
+        meta_cols.append("lead_bucket_label")
 
     feature_candidates = [
         col for col in work.columns if col not in drop_cols and col not in meta_cols
