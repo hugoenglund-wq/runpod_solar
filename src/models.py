@@ -84,14 +84,25 @@ def fit_segmented_regressor(
     if segment_col not in X_train.columns:
         raise ValueError(f"Segment column not found in training matrix: {segment_col}")
 
-    fallback_model = fit_regressor(X_train, y_train, config=config)
+    base_backend = config.backend
+    if base_backend.lower().startswith("segmented_"):
+        base_backend = base_backend[len("segmented_") :]
+    base_config = ModelConfig(
+        random_state=config.random_state,
+        max_iter=config.max_iter,
+        learning_rate=config.learning_rate,
+        max_depth=config.max_depth,
+        backend=base_backend,
+    )
+
+    fallback_model = fit_regressor(X_train, y_train, config=base_config)
     segment_models: dict[int, FittedModel] = {}
     for segment_value, segment_index in X_train.groupby(segment_col, sort=True).groups.items():
         if len(segment_index) < min_segment_rows:
             continue
         X_part = X_train.loc[segment_index].copy()
         y_part = y_train.loc[segment_index].copy()
-        segment_models[int(segment_value)] = fit_regressor(X_part, y_part, config=config)
+        segment_models[int(segment_value)] = fit_regressor(X_part, y_part, config=base_config)
 
     return SegmentedFittedModel(
         backend=f"segmented_{fallback_model.backend}",
