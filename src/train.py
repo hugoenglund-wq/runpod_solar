@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 
 from src.config import SYSTEM_CAPACITY_W
@@ -94,6 +95,8 @@ def train_single_model(
         metadata=metadata,
         feature_config=feature_cfg,
         daylight_only_targets=True,
+        start_date=train_config.start_date,
+        end_date=train_config.end_date,
     )
     frame = filter_date_range(frame, train_config.start_date, train_config.end_date)
     frame = frame.loc[frame["target_power_w"].notna()].copy()
@@ -549,7 +552,8 @@ def build_training_target(
 ) -> pd.Series:
     if not anchor_feature_col or anchor_feature_col not in X.columns:
         return y.copy()
-    return y.astype(float) - X[anchor_feature_col].astype(float)
+    anchor = X[anchor_feature_col].astype(float).fillna(0.0)
+    return y.astype(float) - anchor
 
 
 def wrap_with_residual_anchor(

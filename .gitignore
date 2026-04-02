@@ -1,6 +1,7 @@
 # Local artifacts
 artifacts/
 artifacts_smoke_week/
+artifacts_smoke_*/
 
 # Python cache
 __pycache__/

@@ -71,6 +71,8 @@ def build_day_model_frame(
     metadata: SystemMetadata | None = None,
     feature_config=DEFAULT_FEATURE_CONFIG,
     daylight_only_targets: bool = True,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> pd.DataFrame:
     paths = paths or default_project_paths()
     metadata = metadata or load_system_metadata(paths)
@@ -94,6 +96,13 @@ def build_day_model_frame(
         right_on="timestamp",
         how="left",
     ).drop(columns=["timestamp"])
+    issue_frame = _filter_issue_frame_by_date_range(
+        issue_frame,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if issue_frame.empty:
+        return pd.DataFrame()
 
     if spec.issue_schedule == "daily_23_45":
         issue_frame = issue_frame.loc[
@@ -129,6 +138,14 @@ def build_day_model_frame(
         azimuth_deg=metadata.azimuth,
         system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
     )
+    target_lookup = _filter_target_frame_by_date_range(
+        target_lookup,
+        start_date=start_date,
+        end_date=end_date,
+        day_offset=spec.day_offset,
+    )
+    if target_lookup.empty:
+        return pd.DataFrame()
     if daylight_only_targets:
         target_lookup = target_lookup.loc[target_lookup["target_is_daylight_solar"] == 1].copy()
 
@@ -381,3 +398,34 @@ def _add_baselines(frame: pd.DataFrame, production: pd.DataFrame) -> pd.DataFram
         out["baseline_previous_day_power_w"]
     )
     return out
+
+
+def _filter_issue_frame_by_date_range(
+    frame: pd.DataFrame,
+    *,
+    start_date: str | None,
+    end_date: str | None,
+) -> pd.DataFrame:
+    out = frame.copy()
+    if start_date:
+        out = out.loc[out["origin_time"] >= pd.Timestamp(start_date)].copy()
+    if end_date:
+        out = out.loc[out["origin_time"] <= pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(minutes=15)].copy()
+    return out.reset_index(drop=True)
+
+
+def _filter_target_frame_by_date_range(
+    frame: pd.DataFrame,
+    *,
+    start_date: str | None,
+    end_date: str | None,
+    day_offset: int,
+) -> pd.DataFrame:
+    out = frame.copy()
+    if start_date:
+        min_target_date = pd.Timestamp(start_date).normalize() + pd.Timedelta(days=day_offset)
+        out = out.loc[out["target_date"] >= min_target_date].copy()
+    if end_date:
+        max_target_date = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=day_offset)
+        out = out.loc[out["target_date"] <= max_target_date].copy()
+    return out.reset_index(drop=True)

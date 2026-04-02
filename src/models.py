@@ -154,7 +154,11 @@ def fit_segmented_regressor(
 def predict_regressor(model: FittedModel | SegmentedFittedModel | ResidualFittedModel, X: pd.DataFrame) -> np.ndarray:
     if isinstance(model, ResidualFittedModel):
         residual_pred = predict_regressor(model.residual_model, X)
-        anchor = X[model.anchor_feature_col].astype(float).to_numpy() if model.anchor_feature_col in X.columns else 0.0
+        anchor = (
+            X[model.anchor_feature_col].astype(float).fillna(0.0).to_numpy()
+            if model.anchor_feature_col in X.columns
+            else 0.0
+        )
         return residual_pred + anchor
 
     if isinstance(model, SegmentedFittedModel):
