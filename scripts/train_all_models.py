@@ -70,6 +70,10 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="Fail early if a model receives fewer rows than this in validation split.",
     )
+    parser.add_argument(
+        "--model-names",
+        help="Optional comma-separated subset, e.g. day_0 or day_0,day_1.",
+    )
     return parser.parse_args()
 
 
@@ -90,6 +94,7 @@ def main() -> int:
         artifacts_dir=Path(args.artifacts_dir),
         train_config=config,
         project_root=PROJECT_ROOT,
+        model_names=tuple(part.strip() for part in args.model_names.split(",")) if args.model_names else None,
     )
     print("\nTraining complete.")
     print(metrics.to_string(index=False))

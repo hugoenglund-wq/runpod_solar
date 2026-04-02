@@ -97,13 +97,17 @@ def add_relative_physics_features(
     system_capacity_w: float,
 ) -> pd.DataFrame:
     out = frame.copy()
+    origin_clear_sky = None
+    target_clear_sky = None
 
     if "origin_clear_sky_power_proxy_w" in out.columns:
         origin_norm = _safe_clear_sky_normalizer(out["origin_clear_sky_power_proxy_w"])
+        origin_clear_sky = origin_norm
         out["origin_power_clear_sky_ratio"] = out["power_w"] / origin_norm
 
     if "target_clear_sky_power_proxy_w" in out.columns:
         target_norm = _safe_clear_sky_normalizer(out["target_clear_sky_power_proxy_w"])
+        target_clear_sky = target_norm
         if "baseline_previous_day_power_w" in out.columns:
             out["baseline_previous_day_clear_sky_ratio"] = out["baseline_previous_day_power_w"] / target_norm
         if "baseline_previous_week_power_w" in out.columns:
@@ -115,6 +119,35 @@ def add_relative_physics_features(
         solar_norm = np.maximum(out["origin_solar_cos_zenith"].to_numpy(dtype=float), 0.05)
         out["origin_shortwave_cos_ratio"] = out["hist_shortwave_radiation"].to_numpy(dtype=float) / solar_norm
 
+    if "baseline_issue_persistence_w" in out.columns:
+        out["feature_baseline_issue_persistence_w"] = out["baseline_issue_persistence_w"].astype(float)
+    if "baseline_previous_day_power_w" in out.columns:
+        out["feature_baseline_previous_day_power_w"] = out["baseline_previous_day_power_w"].astype(float)
+    if "baseline_previous_week_power_w" in out.columns:
+        out["feature_baseline_previous_week_power_w"] = out["baseline_previous_week_power_w"].astype(float)
+
+    if origin_clear_sky is not None and target_clear_sky is not None:
+        clear_sky_progression_ratio = target_clear_sky / origin_clear_sky
+        out["clear_sky_progression_ratio"] = clear_sky_progression_ratio
+        if "baseline_issue_persistence_w" in out.columns:
+            out["feature_persistence_clear_sky_scaled_w"] = (
+                out["baseline_issue_persistence_w"].to_numpy(dtype=float) * clear_sky_progression_ratio
+            )
+        if "origin_panel_cos_incidence" in out.columns and "target_panel_cos_incidence" in out.columns:
+            origin_panel_norm = np.maximum(out["origin_panel_cos_incidence"].to_numpy(dtype=float), 0.02)
+            target_panel = out["target_panel_cos_incidence"].to_numpy(dtype=float)
+            out["panel_incidence_progression_ratio"] = target_panel / origin_panel_norm
+
+    if target_clear_sky is not None:
+        if "baseline_previous_day_clear_sky_ratio" in out.columns:
+            out["feature_previous_day_clear_sky_scaled_w"] = (
+                out["baseline_previous_day_clear_sky_ratio"].to_numpy(dtype=float) * target_clear_sky
+            )
+        if "baseline_previous_week_clear_sky_ratio" in out.columns:
+            out["feature_previous_week_clear_sky_scaled_w"] = (
+                out["baseline_previous_week_clear_sky_ratio"].to_numpy(dtype=float) * target_clear_sky
+            )
+
     if "lead_hours" in out.columns:
         lead_hours = out["lead_hours"].to_numpy(dtype=float)
         out["lead_bucket_code"] = _compute_lead_bucket_codes(lead_hours)
@@ -124,6 +157,41 @@ def add_relative_physics_features(
             (lead_hours > LEAD_BUCKET_BOUNDS_HOURS[0]) & (lead_hours <= LEAD_BUCKET_BOUNDS_HOURS[2])
         ).astype(int)
         out["is_long_lead"] = (lead_hours > LEAD_BUCKET_BOUNDS_HOURS[2]).astype(int)
+
+        persistence_weight = np.clip(1.0 - (lead_hours / 8.0), 0.15, 0.95)
+        weekly_weight = np.clip((lead_hours - 2.0) / 14.0, 0.0, 0.30)
+        out["intraday_persistence_weight"] = persistence_weight
+        out["intraday_weekly_weight"] = weekly_weight
+
+        persistence_scaled = out.get("feature_persistence_clear_sky_scaled_w", out.get("feature_baseline_issue_persistence_w"))
+        prev_day_scaled = out.get("feature_previous_day_clear_sky_scaled_w", out.get("feature_baseline_previous_day_power_w"))
+        prev_week_scaled = out.get(
+            "feature_previous_week_clear_sky_scaled_w",
+            out.get("feature_baseline_previous_week_power_w", prev_day_scaled),
+        )
+        if persistence_scaled is not None and prev_day_scaled is not None:
+            persistence_scaled_values = np.asarray(persistence_scaled, dtype=float)
+            prev_day_scaled_values = np.asarray(prev_day_scaled, dtype=float)
+            prev_week_scaled_values = np.asarray(prev_week_scaled, dtype=float)
+            day_blend = (
+                persistence_weight * persistence_scaled_values
+                + (1.0 - persistence_weight) * prev_day_scaled_values
+            )
+            out["feature_intraday_baseline_blend_w"] = (
+                (1.0 - weekly_weight) * day_blend + weekly_weight * prev_week_scaled_values
+            )
+
+    if "target_fcst_panel_radiation_proxy" in out.columns and target_clear_sky is not None:
+        out["feature_fcst_panel_clear_sky_ratio"] = (
+            out["target_fcst_panel_radiation_proxy"].to_numpy(dtype=float) / target_clear_sky
+        )
+        if "feature_intraday_baseline_blend_w" in out.columns:
+            forecast_factor = np.clip(out["feature_fcst_panel_clear_sky_ratio"].to_numpy(dtype=float), 0.0, 1.6)
+            baseline_factor = np.clip(out["target_clear_sky_capacity_ratio"].to_numpy(dtype=float), 0.02, 1.0)
+            out["feature_intraday_fcst_adjusted_blend_w"] = (
+                out["feature_intraday_baseline_blend_w"].to_numpy(dtype=float)
+                * np.where(baseline_factor > 0.0, forecast_factor / baseline_factor, 1.0)
+            )
 
     return out
 

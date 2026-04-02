@@ -32,28 +32,36 @@ class SegmentedFittedModel:
     fallback_model: FittedModel
 
 
+@dataclass(frozen=True)
+class ResidualFittedModel:
+    backend: str
+    residual_model: FittedModel | SegmentedFittedModel
+    anchor_feature_col: str
+
+
 def fit_regressor(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     *,
     config: ModelConfig = ModelConfig(),
+    sample_weight: pd.Series | np.ndarray | None = None,
 ) -> FittedModel:
     backend = config.backend.lower()
     if backend == "lightgbm":
-        lightgbm_model = _try_fit_lightgbm(X_train, y_train, config)
+        lightgbm_model = _try_fit_lightgbm(X_train, y_train, config, sample_weight=sample_weight)
         if lightgbm_model is not None:
             return lightgbm_model
     elif backend == "xgboost":
-        xgboost_model = _try_fit_xgboost(X_train, y_train, config)
+        xgboost_model = _try_fit_xgboost(X_train, y_train, config, sample_weight=sample_weight)
         if xgboost_model is not None:
             return xgboost_model
     elif backend == "auto":
         preferred = ["xgboost", "lightgbm"] if len(X_train) <= 50_000 else ["lightgbm", "xgboost"]
         for candidate in preferred:
             fitted = (
-                _try_fit_xgboost(X_train, y_train, config)
+                _try_fit_xgboost(X_train, y_train, config, sample_weight=sample_weight)
                 if candidate == "xgboost"
-                else _try_fit_lightgbm(X_train, y_train, config)
+                else _try_fit_lightgbm(X_train, y_train, config, sample_weight=sample_weight)
             )
             if fitted is not None:
                 return fitted
@@ -66,7 +74,7 @@ def fit_regressor(
         min_samples_leaf=30,
         l2_regularization=0.01,
     )
-    estimator.fit(X_train, y_train)
+    estimator.fit(X_train, y_train, sample_weight=sample_weight)
     return FittedModel(
         backend="sklearn_hist_gradient_boosting",
         estimator=estimator,
@@ -82,6 +90,7 @@ def fit_segmented_regressor(
     config: ModelConfig = ModelConfig(),
     min_segment_rows: int = 1_000,
     segment_backend_overrides: dict[int, str] | None = None,
+    sample_weight: pd.Series | np.ndarray | None = None,
 ) -> SegmentedFittedModel:
     if segment_col not in X_train.columns:
         raise ValueError(f"Segment column not found in training matrix: {segment_col}")
@@ -97,7 +106,7 @@ def fit_segmented_regressor(
         backend=base_backend,
     )
 
-    fallback_model = fit_regressor(X_train, y_train, config=base_config)
+    fallback_model = fit_regressor(X_train, y_train, config=base_config, sample_weight=sample_weight)
     segment_backend_overrides = segment_backend_overrides or {}
     segment_backends: dict[int, str] = {}
     segment_models: dict[int, FittedModel] = {}
@@ -114,8 +123,19 @@ def fit_segmented_regressor(
         )
         X_part = X_train.loc[segment_index].copy()
         y_part = y_train.loc[segment_index].copy()
+        weight_part = None
+        if sample_weight is not None:
+            if isinstance(sample_weight, pd.Series):
+                weight_part = sample_weight.loc[segment_index].copy()
+            else:
+                weight_part = np.asarray(sample_weight)[segment_index]
         segment_value_int = int(segment_value)
-        segment_models[segment_value_int] = fit_regressor(X_part, y_part, config=segment_config)
+        segment_models[segment_value_int] = fit_regressor(
+            X_part,
+            y_part,
+            config=segment_config,
+            sample_weight=weight_part,
+        )
         segment_backends[segment_value_int] = segment_models[segment_value_int].backend
 
     unique_backends = sorted(set(segment_backends.values()) | {fallback_model.backend})
@@ -131,7 +151,12 @@ def fit_segmented_regressor(
     )
 
 
-def predict_regressor(model: FittedModel | SegmentedFittedModel, X: pd.DataFrame) -> np.ndarray:
+def predict_regressor(model: FittedModel | SegmentedFittedModel | ResidualFittedModel, X: pd.DataFrame) -> np.ndarray:
+    if isinstance(model, ResidualFittedModel):
+        residual_pred = predict_regressor(model.residual_model, X)
+        anchor = X[model.anchor_feature_col].astype(float).to_numpy() if model.anchor_feature_col in X.columns else 0.0
+        return residual_pred + anchor
+
     if isinstance(model, SegmentedFittedModel):
         if model.segment_col not in X.columns:
             return _predict_with_single_model(model.fallback_model, X)
@@ -161,6 +186,8 @@ def _try_fit_lightgbm(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     config: ModelConfig,
+    *,
+    sample_weight: pd.Series | np.ndarray | None = None,
 ) -> FittedModel | None:
     try:
         from lightgbm import LGBMRegressor
@@ -176,7 +203,7 @@ def _try_fit_lightgbm(
         colsample_bytree=0.9,
         random_state=config.random_state,
     )
-    estimator.fit(X_train, y_train)
+    estimator.fit(X_train, y_train, sample_weight=sample_weight)
     return FittedModel(
         backend="lightgbm",
         estimator=estimator,
@@ -188,6 +215,8 @@ def _try_fit_xgboost(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     config: ModelConfig,
+    *,
+    sample_weight: pd.Series | np.ndarray | None = None,
 ) -> FittedModel | None:
     try:
         from xgboost import XGBRegressor
@@ -206,7 +235,7 @@ def _try_fit_xgboost(
         tree_method="hist",
         n_jobs=0,
     )
-    estimator.fit(X_train, y_train)
+    estimator.fit(X_train, y_train, sample_weight=sample_weight)
     return FittedModel(
         backend="xgboost",
         estimator=estimator,

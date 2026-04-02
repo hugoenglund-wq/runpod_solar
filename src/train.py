@@ -22,7 +22,7 @@ from src.evaluate import (
     evaluate_prediction_frame,
 )
 from src.models import ModelConfig, fit_regressor, predict_regressor
-from src.models import fit_segmented_regressor
+from src.models import ResidualFittedModel, fit_segmented_regressor
 from src.splits import (
     BacktestConfig,
     build_issue_date_backtest_folds,
@@ -51,9 +51,11 @@ def train_all_models(
     model_specs: tuple[DayModelSpec, ...] = DEFAULT_DAY_MODEL_SPECS,
     train_config: TrainConfig = TrainConfig(),
     project_root: Path | None = None,
+    model_names: tuple[str, ...] | None = None,
 ) -> pd.DataFrame:
     paths = default_project_paths(project_root)
     metadata = load_system_metadata(paths)
+    selected_specs = _filter_model_specs(model_specs, model_names=model_names)
     ensure_dir(artifacts_dir)
     ensure_dir(artifacts_dir / "models")
     ensure_dir(artifacts_dir / "metrics")
@@ -61,7 +63,7 @@ def train_all_models(
     ensure_dir(artifacts_dir / "datasets")
 
     rows: list[dict[str, object]] = []
-    for spec in model_specs:
+    for spec in selected_specs:
         row = train_single_model(
             spec=spec,
             train_config=train_config,
@@ -109,6 +111,8 @@ def train_single_model(
 
     first_train, first_val = split_frame_for_fold(frame, folds[0])
     use_segmented_model = bool(spec.day_offset == 0 and "lead_bucket_code" in frame.columns)
+    residual_anchor_col = choose_residual_anchor_feature(frame, spec=spec)
+    first_train_weights = build_training_weights(first_train, spec=spec)
     segment_backend_overrides: dict[int, str] = {}
     if use_segmented_model:
         selected_backend, segment_backend_overrides = choose_segmented_backends(
@@ -116,6 +120,8 @@ def train_single_model(
             val_df=first_val,
             random_state=train_config.random_state,
             system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
+            anchor_feature_col=residual_anchor_col,
+            train_weights=first_train_weights,
         )
     else:
         selected_backend = choose_backend(
@@ -125,6 +131,8 @@ def train_single_model(
             random_state=train_config.random_state,
             system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
             segmented=False,
+            anchor_feature_col=residual_anchor_col,
+            train_weights=first_train_weights,
         )
 
     model_dir = ensure_dir(artifacts_dir / "models" / spec.name)
@@ -145,25 +153,30 @@ def train_single_model(
 
         X_train, y_train, _, feature_cols = prepare_model_matrix(train_df)
         X_val, _, meta_val, _ = prepare_model_matrix(val_df)
+        train_weights = build_training_weights(train_df, spec=spec)
+        y_train_fit = build_training_target(y_train, X_train, anchor_feature_col=residual_anchor_col)
         model_config = ModelConfig(
             random_state=train_config.random_state,
             backend=selected_backend,
         )
         if use_segmented_model:
-            model = fit_segmented_regressor(
+            fitted_model = fit_segmented_regressor(
                 X_train,
-                y_train,
+                y_train_fit,
                 segment_col="lead_bucket_code",
                 config=model_config,
                 min_segment_rows=max(500, train_config.min_train_rows),
                 segment_backend_overrides=segment_backend_overrides,
+                sample_weight=train_weights,
             )
         else:
-            model = fit_regressor(
+            fitted_model = fit_regressor(
                 X_train,
-                y_train,
+                y_train_fit,
                 config=model_config,
+                sample_weight=train_weights,
             )
+        model = wrap_with_residual_anchor(fitted_model, anchor_feature_col=residual_anchor_col)
         y_pred = clip_physical_predictions(
             predict_regressor(model, X_val),
             system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
@@ -260,25 +273,30 @@ def train_single_model(
         )
 
     X_full, y_full, _, feature_cols = prepare_model_matrix(frame)
+    full_train_weights = build_training_weights(frame, spec=spec)
+    y_full_fit = build_training_target(y_full, X_full, anchor_feature_col=residual_anchor_col)
     final_model_config = ModelConfig(
         random_state=train_config.random_state,
         backend=selected_backend,
     )
     if use_segmented_model:
-        final_model = fit_segmented_regressor(
+        fitted_final_model = fit_segmented_regressor(
             X_full,
-            y_full,
+            y_full_fit,
             segment_col="lead_bucket_code",
             config=final_model_config,
             min_segment_rows=max(2_000, train_config.min_train_rows),
             segment_backend_overrides=segment_backend_overrides,
+            sample_weight=full_train_weights,
         )
     else:
-        final_model = fit_regressor(
+        fitted_final_model = fit_regressor(
             X_full,
-            y_full,
+            y_full_fit,
             config=final_model_config,
+            sample_weight=full_train_weights,
         )
+    final_model = wrap_with_residual_anchor(fitted_final_model, anchor_feature_col=residual_anchor_col)
 
     model_path = model_dir / "model.joblib"
     model_meta = {
@@ -291,6 +309,7 @@ def train_single_model(
         "feature_columns": feature_cols,
         "daylight_only_targets": True,
         "segmented_by": "lead_bucket_code" if use_segmented_model else None,
+        "residual_anchor_feature": residual_anchor_col,
         "season_coverage": season_coverage,
         "warnings": warnings,
     }
@@ -360,6 +379,8 @@ def choose_backend(
     random_state: int,
     system_capacity_w: float,
     segmented: bool,
+    anchor_feature_col: str | None = None,
+    train_weights: pd.Series | None = None,
 ) -> str:
     candidates = ["xgboost", "lightgbm"]
     results: list[tuple[str, float]] = []
@@ -367,22 +388,29 @@ def choose_backend(
     val_sample = _sample_frame_for_backend_selection(val_df, max_rows=100_000)
     X_train, y_train, _, _ = prepare_model_matrix(train_sample)
     X_val, _, _, _ = prepare_model_matrix(val_sample)
+    y_train_fit = build_training_target(y_train, X_train, anchor_feature_col=anchor_feature_col)
+    train_weight_sample = None
+    if train_weights is not None:
+        train_weight_sample = train_weights.loc[train_sample.index].copy()
     for backend in candidates:
         model_config = ModelConfig(random_state=random_state, backend=backend)
         if segmented and "lead_bucket_code" in X_train.columns:
-            model = fit_segmented_regressor(
+            fitted_model = fit_segmented_regressor(
                 X_train,
-                y_train,
+                y_train_fit,
                 segment_col="lead_bucket_code",
                 config=model_config,
                 min_segment_rows=max(250, int(len(X_train) * 0.01)),
+                sample_weight=train_weight_sample,
             )
         else:
-            model = fit_regressor(
+            fitted_model = fit_regressor(
                 X_train,
-                y_train,
+                y_train_fit,
                 config=model_config,
+                sample_weight=train_weight_sample,
             )
+        model = wrap_with_residual_anchor(fitted_model, anchor_feature_col=anchor_feature_col)
         y_pred = clip_physical_predictions(
             predict_regressor(model, X_val),
             system_capacity_w=system_capacity_w,
@@ -408,20 +436,28 @@ def choose_segmented_backends(
     val_df: pd.DataFrame,
     random_state: int,
     system_capacity_w: float,
+    anchor_feature_col: str | None = None,
+    train_weights: pd.Series | None = None,
 ) -> tuple[str, dict[int, str]]:
     candidate_backends = ["xgboost", "lightgbm", "sklearn_hist_gradient_boosting"]
     fallback_train = _sample_frame_for_backend_selection(train_df, max_rows=300_000)
     fallback_val = _sample_frame_for_backend_selection(val_df, max_rows=120_000)
     X_train, y_train, _, _ = prepare_model_matrix(fallback_train)
     X_val, _, _, _ = prepare_model_matrix(fallback_val)
+    y_train_fit = build_training_target(y_train, X_train, anchor_feature_col=anchor_feature_col)
+    fallback_train_weights = None
+    if train_weights is not None:
+        fallback_train_weights = train_weights.loc[fallback_train.index].copy()
 
     fallback_results: list[tuple[str, float]] = []
     for backend in candidate_backends:
-        model = fit_regressor(
+        fitted_model = fit_regressor(
             X_train,
-            y_train,
+            y_train_fit,
             config=ModelConfig(random_state=random_state, backend=backend),
+            sample_weight=fallback_train_weights,
         )
+        model = wrap_with_residual_anchor(fitted_model, anchor_feature_col=anchor_feature_col)
         y_pred = clip_physical_predictions(
             predict_regressor(model, X_val),
             system_capacity_w=system_capacity_w,
@@ -451,14 +487,20 @@ def choose_segmented_backends(
         val_part = _sample_frame_for_backend_selection(val_part, max_rows=60_000)
         X_train, y_train, _, _ = prepare_model_matrix(train_part)
         X_val, _, _, _ = prepare_model_matrix(val_part)
+        y_train_fit = build_training_target(y_train, X_train, anchor_feature_col=anchor_feature_col)
+        part_train_weights = None
+        if train_weights is not None:
+            part_train_weights = train_weights.loc[train_part.index].copy()
 
         results: list[tuple[str, float]] = []
         for backend in candidate_backends:
-            model = fit_regressor(
+            fitted_model = fit_regressor(
                 X_train,
-                y_train,
+                y_train_fit,
                 config=ModelConfig(random_state=random_state, backend=backend),
+                sample_weight=part_train_weights,
             )
+            model = wrap_with_residual_anchor(fitted_model, anchor_feature_col=anchor_feature_col)
             y_pred = clip_physical_predictions(
                 predict_regressor(model, X_val),
                 system_capacity_w=system_capacity_w,
@@ -481,7 +523,91 @@ def choose_segmented_backends(
 def _sample_frame_for_backend_selection(frame: pd.DataFrame, *, max_rows: int) -> pd.DataFrame:
     if len(frame) <= max_rows:
         return frame
-    return frame.sample(n=max_rows, random_state=42).sort_values("origin_time").reset_index(drop=True)
+    return frame.sample(n=max_rows, random_state=42).sort_values("origin_time")
+
+
+def choose_residual_anchor_feature(frame: pd.DataFrame, *, spec: DayModelSpec) -> str | None:
+    if spec.day_offset != 0:
+        return None
+    preferred_cols = (
+        "feature_intraday_fcst_adjusted_blend_w",
+        "feature_intraday_baseline_blend_w",
+        "feature_persistence_clear_sky_scaled_w",
+        "feature_baseline_issue_persistence_w",
+    )
+    for col in preferred_cols:
+        if col in frame.columns:
+            return col
+    return None
+
+
+def build_training_target(
+    y: pd.Series,
+    X: pd.DataFrame,
+    *,
+    anchor_feature_col: str | None,
+) -> pd.Series:
+    if not anchor_feature_col or anchor_feature_col not in X.columns:
+        return y.copy()
+    return y.astype(float) - X[anchor_feature_col].astype(float)
+
+
+def wrap_with_residual_anchor(
+    model,
+    *,
+    anchor_feature_col: str | None,
+):
+    if not anchor_feature_col:
+        return model
+    return ResidualFittedModel(
+        backend=f"residual_{model.backend}",
+        residual_model=model,
+        anchor_feature_col=anchor_feature_col,
+    )
+
+
+def build_training_weights(frame: pd.DataFrame, *, spec: DayModelSpec) -> pd.Series | None:
+    if spec.day_offset != 0:
+        return None
+
+    weights = np.ones(len(frame), dtype=float)
+    if "lead_bucket_label" in frame.columns:
+        bucket_weights = frame["lead_bucket_label"].map(
+            {
+                "0_1h": 4.0,
+                "1_3h": 2.5,
+                "3_6h": 1.6,
+                "6h_plus": 1.0,
+            }
+        ).fillna(1.0)
+        weights *= bucket_weights.to_numpy(dtype=float)
+    elif "lead_hours" in frame.columns:
+        lead_hours = frame["lead_hours"].to_numpy(dtype=float)
+        weights *= np.where(
+            lead_hours <= 1.0,
+            4.0,
+            np.where(lead_hours <= 3.0, 2.5, np.where(lead_hours <= 6.0, 1.6, 1.0)),
+        )
+
+    if "target_clear_sky_capacity_ratio" in frame.columns:
+        peak_weight = 1.0 + 0.75 * np.clip(frame["target_clear_sky_capacity_ratio"].to_numpy(dtype=float), 0.0, 1.0)
+        weights *= peak_weight
+
+    return pd.Series(weights, index=frame.index, dtype=float)
+
+
+def _filter_model_specs(
+    model_specs: tuple[DayModelSpec, ...],
+    *,
+    model_names: tuple[str, ...] | None,
+) -> tuple[DayModelSpec, ...]:
+    if not model_names:
+        return model_specs
+    requested = {name.strip() for name in model_names if name.strip()}
+    selected = tuple(spec for spec in model_specs if spec.name in requested)
+    if not selected:
+        raise ValueError(f"No matching model names found in requested subset: {sorted(requested)}")
+    return selected
 
 
 def filter_date_range(
