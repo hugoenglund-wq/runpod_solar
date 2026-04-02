@@ -260,6 +260,7 @@ def _merge_noaa_gfs_target_forecast_features(
         "temperature_2m": "target_fcst_temperature_2m",
         "cloud_cover": "target_fcst_cloud_cover",
         "shortwave_radiation": "target_fcst_shortwave_radiation",
+        "lead_hours": "target_fcst_lead_hours",
     }
     noaa = noaa.rename(columns=rename_map)
     noaa["forecast_valid_hour"] = noaa["forecast_valid_time"].dt.floor("h")
@@ -268,7 +269,6 @@ def _merge_noaa_gfs_target_forecast_features(
         "forecast_issue_time",
         "forecast_valid_hour",
         "forecast_valid_time",
-        "lead_hours",
         *rename_map.values(),
     ]
     out = frame.copy()
