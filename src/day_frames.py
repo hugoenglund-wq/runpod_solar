@@ -73,6 +73,7 @@ def build_day_model_frame(
     daylight_only_targets: bool = True,
     start_date: str | None = None,
     end_date: str | None = None,
+    verbose: bool = False,
 ) -> pd.DataFrame:
     paths = paths or default_project_paths()
     metadata = metadata or load_system_metadata(paths)
@@ -82,6 +83,7 @@ def build_day_model_frame(
 
     production = load_production_frame(paths, complete_index=True)
     weather_history = load_weather_history_frame(paths)
+    _log_progress(verbose, f"[frame] {spec.name}: loaded production={len(production):,} weather={len(weather_history):,}")
 
     issue_frame = production.rename(
         columns={
@@ -103,12 +105,14 @@ def build_day_model_frame(
     )
     if issue_frame.empty:
         return pd.DataFrame()
+    _log_progress(verbose, f"[frame] {spec.name}: issue rows after date filter={len(issue_frame):,}")
 
     if spec.issue_schedule == "daily_23_45":
         issue_frame = issue_frame.loc[
             (issue_frame["origin_time"].dt.hour == DAILY_ISSUE_HOUR)
             & (issue_frame["origin_time"].dt.minute == DAILY_ISSUE_MINUTE)
         ].copy()
+        _log_progress(verbose, f"[frame] {spec.name}: daily issue rows={len(issue_frame):,}")
 
     issue_frame = build_issue_feature_frame(
         issue_frame,
@@ -146,12 +150,15 @@ def build_day_model_frame(
     )
     if target_lookup.empty:
         return pd.DataFrame()
+    _log_progress(verbose, f"[frame] {spec.name}: target rows after date filter={len(target_lookup):,}")
     if daylight_only_targets:
         target_lookup = target_lookup.loc[target_lookup["target_is_daylight_solar"] == 1].copy()
+        _log_progress(verbose, f"[frame] {spec.name}: daylight target rows={len(target_lookup):,}")
 
     expanded = _expand_issue_target_pairs(issue_frame, target_lookup, spec)
     if expanded.empty:
         return expanded
+    _log_progress(verbose, f"[frame] {spec.name}: expanded issue-target rows={len(expanded):,}")
     for redundant_col in ("is_missing_production_x", "is_missing_production_y"):
         if redundant_col in expanded.columns:
             expanded = expanded.drop(columns=[redundant_col])
@@ -173,6 +180,7 @@ def build_day_model_frame(
         )
         if expanded.empty:
             return expanded
+        _log_progress(verbose, f"[frame] {spec.name}: rows after forecast merge={len(expanded):,}")
         expanded = _add_daily_forecast_aggregates(expanded)
 
     expanded = _add_baselines(expanded, production)
@@ -180,6 +188,7 @@ def build_day_model_frame(
         expanded,
         system_capacity_w=metadata.system_capacity_w or SYSTEM_CAPACITY_W,
     )
+    _log_progress(verbose, f"[frame] {spec.name}: final frame rows={len(expanded):,}")
     expanded["model_name"] = spec.name
     expanded["issue_schedule"] = spec.issue_schedule
     return expanded.reset_index(drop=True)
@@ -429,3 +438,8 @@ def _filter_target_frame_by_date_range(
         max_target_date = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=day_offset)
         out = out.loc[out["target_date"] <= max_target_date].copy()
     return out.reset_index(drop=True)
+
+
+def _log_progress(verbose: bool, message: str) -> None:
+    if verbose:
+        print(message, flush=True)

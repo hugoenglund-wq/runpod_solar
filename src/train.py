@@ -32,6 +32,10 @@ from src.splits import (
 )
 
 
+def _log_progress(message: str) -> None:
+    print(message, flush=True)
+
+
 @dataclass(frozen=True)
 class TrainConfig:
     evaluation_fraction: float = 0.20
@@ -65,6 +69,7 @@ def train_all_models(
 
     rows: list[dict[str, object]] = []
     for spec in selected_specs:
+        _log_progress(f"[train] Starting {spec.name}")
         row = train_single_model(
             spec=spec,
             train_config=train_config,
@@ -97,11 +102,16 @@ def train_single_model(
         daylight_only_targets=True,
         start_date=train_config.start_date,
         end_date=train_config.end_date,
+        verbose=True,
     )
     frame = filter_date_range(frame, train_config.start_date, train_config.end_date)
     frame = frame.loc[frame["target_power_w"].notna()].copy()
     if frame.empty:
         raise ValueError(f"{spec.name}: no rows after filtering.")
+    _log_progress(
+        f"[train] {spec.name}: frame ready with {len(frame):,} rows "
+        f"from {frame['origin_time'].min()} to {frame['origin_time'].max()}"
+    )
 
     backtest_cfg = BacktestConfig(
         evaluation_fraction=train_config.evaluation_fraction,
@@ -111,6 +121,7 @@ def train_single_model(
         purge_issue_days=max(1, spec.day_offset),
     )
     folds = build_issue_date_backtest_folds(frame, config=backtest_cfg)
+    _log_progress(f"[train] {spec.name}: built {len(folds)} backtest fold(s)")
 
     first_train, first_val = split_frame_for_fold(frame, folds[0])
     use_segmented_model = bool(spec.day_offset == 0 and "lead_bucket_code" in frame.columns)
@@ -137,6 +148,10 @@ def train_single_model(
             anchor_feature_col=residual_anchor_col,
             train_weights=first_train_weights,
         )
+    _log_progress(
+        f"[train] {spec.name}: selected backend request={selected_backend} "
+        f"segmented={use_segmented_model} anchor={residual_anchor_col or 'none'}"
+    )
 
     model_dir = ensure_dir(artifacts_dir / "models" / spec.name)
     metrics_dir = ensure_dir(artifacts_dir / "metrics")
@@ -153,6 +168,9 @@ def train_single_model(
             raise ValueError(f"{spec.name}/{fold.fold_name}: train set too small ({len(train_df)} rows).")
         if len(val_df) < train_config.min_val_rows:
             raise ValueError(f"{spec.name}/{fold.fold_name}: validation set too small ({len(val_df)} rows).")
+        _log_progress(
+            f"[train] {spec.name}/{fold.fold_name}: train_rows={len(train_df):,} val_rows={len(val_df):,}"
+        )
 
         X_train, y_train, _, feature_cols = prepare_model_matrix(train_df)
         X_val, _, meta_val, _ = prepare_model_matrix(val_df)
@@ -219,6 +237,11 @@ def train_single_model(
                 "skill_vs_weekly": float(weekly_metrics.get("skill_vs_baseline", 0.0)),
             }
         )
+        _log_progress(
+            f"[train] {spec.name}/{fold.fold_name}: "
+            f"mae={overall_metrics['mae_w']:.1f}W "
+            f"skill_daily={overall_metrics.get('skill_vs_baseline', 0.0):.3f}"
+        )
 
         pred_frame = meta_val.copy()
         pred_frame["fold_name"] = fold.fold_name
@@ -276,6 +299,7 @@ def train_single_model(
         )
 
     X_full, y_full, _, feature_cols = prepare_model_matrix(frame)
+    _log_progress(f"[train] {spec.name}: fitting final model on {len(frame):,} rows")
     full_train_weights = build_training_weights(frame, spec=spec)
     y_full_fit = build_training_target(y_full, X_full, anchor_feature_col=residual_anchor_col)
     final_model_config = ModelConfig(
@@ -323,6 +347,9 @@ def train_single_model(
         },
         model_path,
     )
+    _log_progress(
+        f"[train] {spec.name}: final backend={final_model.backend} saved to {model_path}"
+    )
 
     frame.to_csv(data_dir / f"{spec.name}_train_pool.csv.gz", index=False, compression="gzip")
     validation_backtest.to_csv(
@@ -355,6 +382,11 @@ def train_single_model(
     (metrics_dir / f"{spec.name}_metrics.json").write_text(
         json.dumps(metrics_payload, indent=2),
         encoding="utf-8",
+    )
+    _log_progress(
+        f"[train] {spec.name}: backtest mae={overall_backtest_metrics['mae_w']:.1f}W "
+        f"rmse={overall_backtest_metrics['rmse_w']:.1f}W "
+        f"skill_daily={overall_backtest_metrics.get('skill_vs_baseline', 0.0):.3f}"
     )
 
     return {
